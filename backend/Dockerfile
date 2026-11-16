@@ -7,7 +7,7 @@ RUN CGO_ENABLED=0 go build -ldflags="-s -w" -o /out/signer-server ./cmd/server
 
 FROM debian:bookworm-slim AS zsign-builder
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    g++ make git ca-certificates libssl-dev zlib1g-dev \
+    g++ make git ca-certificates pkg-config libssl-dev zlib1g-dev \
     && rm -rf /var/lib/apt/lists/*
 RUN git clone --depth 1 https://github.com/zhlynn/zsign.git /zsign \
     && cd /zsign/build/linux \
