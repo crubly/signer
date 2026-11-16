@@ -2,6 +2,8 @@ package apple
 
 import (
 	"bytes"
+	"crypto/aes"
+	"crypto/cipher"
 	"crypto/hmac"
 	"crypto/rand"
 	"crypto/rsa"
@@ -250,9 +252,9 @@ func (c *Client) StartLogin(appleID, password string) (*AuthResult, *PendingAuth
 	uHash.Write(bPadded)
 	u := new(big.Int).SetBytes(uHash.Sum(nil))
 
-	// x = H(salt | H(username + ":" + derived))
+	// x = H(salt | H(":" | derived))  [Apple GSA SRP omits username here]
 	idHash := sha256.New()
-	idHash.Write([]byte(appleID + ":"))
+	idHash.Write([]byte(":"))
 	idHash.Write(derived)
 	xHash := sha256.New()
 	xHash.Write(saltBytes)
@@ -320,8 +322,15 @@ func (c *Client) StartLogin(appleID, password string) (*AuthResult, *PendingAuth
 		if au, _ := status["au"].(string); au == "trustedDeviceSecondaryAuth" || au == "secondaryAuth" {
 			dsid, _ := compResp["dsid"].(string)
 			idms := ""
-			if spd, ok := compResp["spd"].([]byte); ok {
-				_ = spd
+			if spdEnc, ok := compResp["spd"].([]byte); ok && len(spdEnc) > 0 {
+				if spdMap, err := decryptSPD(K[:], spdEnc); err == nil {
+					if v, ok := spdMap["adsid"].(string); ok && v != "" {
+						dsid = v
+					}
+					if v, ok := spdMap["GsIdmsToken"].(string); ok {
+						idms = v
+					}
+				}
 			}
 			pending := &PendingAuth{
 				AppleID:   appleID,
@@ -342,9 +351,15 @@ func (c *Client) StartLogin(appleID, password string) (*AuthResult, *PendingAuth
 	// Extract spd (encrypted with K) if present
 	dsid, _ := compResp["dsid"].(string)
 	gsToken := ""
-	if spdEnc, ok := compResp["spd"].([]byte); ok {
-		_ = hmac.New(sha256.New, K[:])
-		_ = spdEnc
+	if spdEnc, ok := compResp["spd"].([]byte); ok && len(spdEnc) > 0 {
+		if spdMap, err := decryptSPD(K[:], spdEnc); err == nil {
+			if v, ok := spdMap["adsid"].(string); ok && v != "" {
+				dsid = v
+			}
+			if v, ok := spdMap["GsIdmsToken"].(string); ok {
+				gsToken = v
+			}
+		}
 	}
 	cookieMap := map[string]string{}
 	for _, ck := range cookies {
@@ -620,6 +635,38 @@ func (c *Client) applyAnisetteHeaders(req *http.Request, a AnisetteHeaders) {
 	if a.ClientTime != "" {
 		req.Header.Set("X-Apple-I-Client-Time", a.ClientTime)
 	}
+}
+
+func decryptSPD(sessionKey, spdEnc []byte) (map[string]any, error) {
+	kMac := hmac.New(sha256.New, sessionKey)
+	kMac.Write([]byte("extra data key:"))
+	aesKey := kMac.Sum(nil)
+
+	ivMac := hmac.New(sha256.New, sessionKey)
+	ivMac.Write([]byte("extra data iv:"))
+	iv := ivMac.Sum(nil)[:16]
+
+	block, err := aes.NewCipher(aesKey)
+	if err != nil {
+		return nil, err
+	}
+	if len(spdEnc)%aes.BlockSize != 0 {
+		return nil, errors.New("invalid spd ciphertext length")
+	}
+	plain := make([]byte, len(spdEnc))
+	cipher.NewCBCDecrypter(block, iv).CryptBlocks(plain, spdEnc)
+	// PKCS7 unpad
+	if len(plain) > 0 {
+		pad := int(plain[len(plain)-1])
+		if pad > 0 && pad <= aes.BlockSize && pad <= len(plain) {
+			plain = plain[:len(plain)-pad]
+		}
+	}
+	var out map[string]any
+	if _, err := plist.Unmarshal(plain, &out); err != nil {
+		return nil, err
+	}
+	return out, nil
 }
 
 func padBigInt(v *big.Int, size int) []byte {
