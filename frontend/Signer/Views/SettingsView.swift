@@ -23,7 +23,7 @@ struct SettingsView: View {
                         Text(user.appleID)
                             .font(.headline)
                     }
-                    Button("Re-authenticate Apple ID") {
+                    Button("Switch / Change Apple ID") {
                         showAppleLogin = true
                     }
                     Button("Sign Out", role: .destructive) {

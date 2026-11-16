@@ -74,6 +74,8 @@ func (s *Server) Handler() http.Handler {
 	mux.Handle("POST /api/apps/from-url", s.requireAuth(http.HandlerFunc(s.handleIPAFromURL)))
 	mux.Handle("POST /api/apps/{id}/sign", s.requireAuth(http.HandlerFunc(s.handleSignApp)))
 	mux.Handle("POST /api/apps/{id}/renew", s.requireAuth(http.HandlerFunc(s.handleRenewApp)))
+	mux.Handle("POST /api/apps/{id}/deactivate", s.requireAuth(http.HandlerFunc(s.handleDeactivateApp)))
+	mux.Handle("POST /api/apps/{id}/activate", s.requireAuth(http.HandlerFunc(s.handleActivateApp)))
 	mux.Handle("DELETE /api/apps/{id}", s.requireAuth(http.HandlerFunc(s.handleDeleteApp)))
 
 	// Public OTA manifest & IPA download (for iOS itms-services://)
@@ -625,6 +627,26 @@ func (s *Server) handleRenewApp(w http.ResponseWriter, r *http.Request) {
 		"app":     app,
 		"ota_url": otaURL,
 	})
+}
+
+func (s *Server) handleDeactivateApp(w http.ResponseWriter, r *http.Request) {
+	uid := currentUserID(r)
+	appID := r.PathValue("id")
+	app, err := s.store.GetApp(appID)
+	if err != nil || app == nil || app.UserID != uid {
+		writeErr(w, http.StatusNotFound, "app not found")
+		return
+	}
+	app.Status = "deactivated"
+	if err := s.store.SaveApp(*app); err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, app)
+}
+
+func (s *Server) handleActivateApp(w http.ResponseWriter, r *http.Request) {
+	s.handleRenewApp(w, r)
 }
 
 func (s *Server) handleDeleteApp(w http.ResponseWriter, r *http.Request) {

@@ -34,7 +34,7 @@ final class APIClient: ObservableObject {
     }()
 
     init() {
-        self.serverURL = UserDefaults.standard.string(forKey: "signer_server_url") ?? "https://sign.yourdomain.com"
+        self.serverURL = UserDefaults.standard.string(forKey: "signer_server_url") ?? "https://signed.bondys.shop"
         self.jwtToken = KeychainHelper.load(key: "jwt_token")
     }
 
@@ -216,6 +216,27 @@ final class APIClient: ObservableObject {
     func renewApp(id: String) async -> SignResponse? {
         do {
             let data = try await request("POST", "/api/apps/\(id)/renew")
+            let res = try decoder.decode(SignResponse.self, from: data)
+            await fetchApps()
+            return res
+        } catch {
+            self.errorMessage = error.localizedDescription
+            return nil
+        }
+    }
+
+    func deactivateApp(id: String) async {
+        do {
+            _ = try await request("POST", "/api/apps/\(id)/deactivate")
+            await fetchApps()
+        } catch {
+            self.errorMessage = error.localizedDescription
+        }
+    }
+
+    func activateApp(id: String) async -> SignResponse? {
+        do {
+            let data = try await request("POST", "/api/apps/\(id)/activate")
             let res = try decoder.decode(SignResponse.self, from: data)
             await fetchApps()
             return res

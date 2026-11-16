@@ -7,7 +7,7 @@ struct SignerApp: App {
 
     init() {
         NotificationManager.shared.requestPermission()
-        BGTaskScheduler.shared.register(forTaskWithIdentifier: "com.crubly.signer.refresh", using: nil) { task in
+        BGTaskScheduler.shared.register(forTaskWithIdentifier: "com.crubly.signed.refresh", using: nil) { task in
             guard let refreshTask = task as? BGAppRefreshTask else {
                 task.setTaskCompleted(success: false)
                 return
@@ -37,7 +37,7 @@ struct SignerApp: App {
     }
 
     static func scheduleBackgroundRefresh() {
-        let req = BGAppRefreshTaskRequest(identifier: "com.crubly.signer.refresh")
+        let req = BGAppRefreshTaskRequest(identifier: "com.crubly.signed.refresh")
         req.earliestBeginDate = Date(timeIntervalSinceNow: 4 * 3600)
         try? BGTaskScheduler.shared.submit(req)
     }

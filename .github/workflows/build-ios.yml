@@ -10,7 +10,7 @@ on:
 
 jobs:
   build-ipa:
-    runs-on: macos-latest
+    runs-on: macos-15
     permissions:
       contents: write
     steps:
@@ -31,7 +31,7 @@ jobs:
             -scheme Signer \
             -configuration Release \
             -sdk iphoneos \
-            -archivePath "$RUNNER_TEMP/Signer.xcarchive" \
+            -archivePath "$RUNNER_TEMP/Signed.xcarchive" \
             CODE_SIGNING_ALLOWED=NO \
             CODE_SIGNING_REQUIRED=NO \
             CODE_SIGN_IDENTITY="" \
@@ -40,22 +40,22 @@ jobs:
       - name: Package Unsigned IPA
         run: |
           mkdir -p "$RUNNER_TEMP/ipa/Payload"
-          cp -r "$RUNNER_TEMP/Signer.xcarchive/Products/Applications/Signer.app" "$RUNNER_TEMP/ipa/Payload/"
+          cp -r "$RUNNER_TEMP/Signed.xcarchive/Products/Applications/Signed.app" "$RUNNER_TEMP/ipa/Payload/"
           cd "$RUNNER_TEMP/ipa"
-          zip -qry "$RUNNER_TEMP/Signer.ipa" Payload
+          zip -qry "$RUNNER_TEMP/Signed.ipa" Payload
 
       - name: Upload IPA Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: Signer-iOS-IPA
-          path: ${{ runner.temp }}/Signer.ipa
+          name: Signed-iOS-IPA
+          path: ${{ runner.temp }}/Signed.ipa
 
       - name: Create Release with IPA
         uses: softprops/action-gh-release@v2
         with:
           tag_name: build-${{ github.run_number }}
-          name: Signer iOS Build #${{ github.run_number }}
-          files: ${{ runner.temp }}/Signer.ipa
+          name: Signed iOS Build #${{ github.run_number }}
+          files: ${{ runner.temp }}/Signed.ipa
           prerelease: false
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

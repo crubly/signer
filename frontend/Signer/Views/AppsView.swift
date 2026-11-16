@@ -9,47 +9,126 @@ struct AppsView: View {
     @State private var appToSign: SignedApp?
     @State private var isBusy = false
 
+    var activeApps: [SignedApp] {
+        api.apps.filter { $0.status == "signed" }
+    }
+
+    var inactiveApps: [SignedApp] {
+        api.apps.filter { $0.status != "signed" }
+    }
+
     var body: some View {
         NavigationStack {
             List {
-                if api.apps.isEmpty {
-                    ContentUnavailableView(
-                        "No Apps Yet",
-                        systemImage: "app.dashed",
-                        description: Text("Import an .ipa file or URL to sign it on your server.")
-                    )
-                } else {
-                    ForEach(api.apps) { app in
-                        AppRow(app: app, onSign: {
-                            appToSign = app
-                        }, onRenew: {
-                            Task {
-                                isBusy = true
-                                if let res = await api.renewApp(id: app.id),
-                                   let url = URL(string: res.otaURL) {
-                                    await UIApplication.shared.open(url)
-                                }
-                                isBusy = false
-                            }
-                        }, onInstall: {
-                            let base = api.serverURL.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
-                            let manifest = "\(base)/ota/\(app.id)/manifest.plist"
-                            if let encoded = manifest.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed),
-                               let ota = URL(string: "itms-services://?action=download-manifest&url=\(encoded)") {
-                                UIApplication.shared.open(ota)
-                            }
-                        })
+                Section("Signed (This App)") {
+                    HStack(spacing: 12) {
+                        Image(systemName: "signature")
+                            .font(.title2)
+                            .foregroundStyle(.white)
+                            .frame(width: 44, height: 44)
+                            .background(.blue.gradient, in: RoundedRectangle(cornerRadius: 10))
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text("Signed")
+                                .font(.headline)
+                            Text("com.crubly.signed • v1.0.0")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                        Spacer()
+                        Text("Active")
+                            .font(.caption.weight(.semibold))
+                            .padding(.horizontal, 8)
+                            .padding(.vertical, 4)
+                            .background(Color.green.opacity(0.15))
+                            .foregroundStyle(.green)
+                            .clipShape(Capsule())
                     }
-                    .onDelete { offsets in
-                        for idx in offsets {
-                            let app = api.apps[idx]
-                            Task { await api.deleteApp(id: app.id) }
+                }
+
+                if api.apps.isEmpty {
+                    Section("Sideloaded Apps") {
+                        ContentUnavailableView(
+                            "No Apps Yet",
+                            systemImage: "app.dashed",
+                            description: Text("Import an .ipa file or URL to sign it on your server.")
+                        )
+                    }
+                } else {
+                    if !activeApps.isEmpty {
+                        Section("Active Apps (\(activeApps.count))") {
+                            ForEach(activeApps) { app in
+                                AppRow(app: app, onSign: {
+                                    appToSign = app
+                                }, onRenew: {
+                                    Task {
+                                        isBusy = true
+                                        if let res = await api.renewApp(id: app.id),
+                                           let url = URL(string: res.otaURL) {
+                                            await UIApplication.shared.open(url)
+                                        }
+                                        isBusy = false
+                                    }
+                                }, onToggleActive: {
+                                    Task {
+                                        isBusy = true
+                                        await api.deactivateApp(id: app.id)
+                                        isBusy = false
+                                    }
+                                }, onInstall: {
+                                    let base = api.serverURL.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+                                    let manifest = "\(base)/ota/\(app.id)/manifest.plist"
+                                    if let encoded = manifest.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed),
+                                       let ota = URL(string: "itms-services://?action=download-manifest&url=\(encoded)") {
+                                        UIApplication.shared.open(ota)
+                                    }
+                                })
+                            }
+                            .onDelete { offsets in
+                                for idx in offsets {
+                                    let app = activeApps[idx]
+                                    Task { await api.deleteApp(id: app.id) }
+                                }
+                            }
+                        }
+                    }
+
+                    if !inactiveApps.isEmpty {
+                        Section("Deactivated / Unsigned (\(inactiveApps.count))") {
+                            ForEach(inactiveApps) { app in
+                                AppRow(app: app, onSign: {
+                                    appToSign = app
+                                }, onRenew: {
+                                    Task {
+                                        isBusy = true
+                                        if let res = await api.activateApp(id: app.id),
+                                           let url = URL(string: res.otaURL) {
+                                            await UIApplication.shared.open(url)
+                                        }
+                                        isBusy = false
+                                    }
+                                }, onToggleActive: {
+                                    Task {
+                                        isBusy = true
+                                        if let res = await api.activateApp(id: app.id),
+                                           let url = URL(string: res.otaURL) {
+                                            await UIApplication.shared.open(url)
+                                        }
+                                        isBusy = false
+                                    }
+                                }, onInstall: {})
+                            }
+                            .onDelete { offsets in
+                                for idx in offsets {
+                                    let app = inactiveApps[idx]
+                                    Task { await api.deleteApp(id: app.id) }
+                                }
+                            }
                         }
                     }
                 }
             }
             .refreshable { await api.fetchApps() }
-            .navigationTitle("Apps")
+            .navigationTitle("Signed")
             .toolbar {
                 ToolbarItem(placement: .topBarTrailing) {
                     Menu {
@@ -115,13 +194,20 @@ private struct AppRow: View {
     let app: SignedApp
     let onSign: () -> Void
     let onRenew: () -> Void
+    let onToggleActive: () -> Void
     let onInstall: () -> Void
 
     var badgeColor: Color {
+        if app.status == "deactivated" { return .secondary }
         if app.status != "signed" { return .gray }
         if app.isExpired { return .red }
         if app.isExpiringSoon { return .orange }
         return .green
+    }
+
+    var statusLabel: String {
+        if app.status == "deactivated" { return "Deactivated" }
+        return app.remainingText
     }
 
     var body: some View {
@@ -135,7 +221,7 @@ private struct AppRow: View {
                         .foregroundStyle(.secondary)
                 }
                 Spacer()
-                Text(app.remainingText)
+                Text(statusLabel)
                     .font(.caption.weight(.semibold))
                     .padding(.horizontal, 8)
                     .padding(.vertical, 4)
@@ -150,7 +236,7 @@ private struct AppRow: View {
                     .foregroundStyle(.secondary)
             }
 
-            HStack(spacing: 10) {
+            HStack(spacing: 8) {
                 if app.status == "signed" {
                     Button("Install OTA", action: onInstall)
                         .buttonStyle(.borderedProminent)
@@ -159,8 +245,16 @@ private struct AppRow: View {
                     Button("Renew", action: onRenew)
                         .buttonStyle(.bordered)
                         .controlSize(.small)
+
+                    Button("Deactivate", role: .destructive, action: onToggleActive)
+                        .buttonStyle(.bordered)
+                        .controlSize(.small)
+                } else {
+                    Button("Activate & Sign", action: onToggleActive)
+                        .buttonStyle(.borderedProminent)
+                        .controlSize(.small)
                 }
-                Button("Sign Options", action: onSign)
+                Button("Options", action: onSign)
                     .buttonStyle(.bordered)
                     .controlSize(.small)
             }

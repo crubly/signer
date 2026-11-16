@@ -18,7 +18,7 @@ struct LoginView: View {
                     .foregroundStyle(.blue.gradient)
 
                 VStack(spacing: 6) {
-                    Text("Signer")
+                    Text("Signed")
                         .font(.largeTitle.bold())
                     Text("Sign in with your Apple ID to sign & renew apps")
                         .font(.subheadline)
