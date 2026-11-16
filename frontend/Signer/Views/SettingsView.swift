@@ -10,23 +10,8 @@ struct SettingsView: View {
     var body: some View {
         NavigationStack {
             Form {
-                if let user = api.user {
-                    Section("Google Account") {
-                        VStack(alignment: .leading, spacing: 2) {
-                            Text(user.name.isEmpty ? "Google User" : user.name)
-                                .font(.headline)
-                            Text(user.email)
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
-                        }
-                        Button("Sign Out", role: .destructive) {
-                            api.logout()
-                        }
-                    }
-                }
-
                 Section("Apple Developer Account") {
-                    if let acc = api.appleAccount, acc.loggedIn {
+                    if let acc = api.appleAccount {
                         VStack(alignment: .leading, spacing: 4) {
                             Text(acc.appleID)
                                 .font(.headline)
@@ -34,13 +19,15 @@ struct SettingsView: View {
                                 .font(.caption)
                                 .foregroundStyle(.secondary)
                         }
-                        Button("Re-authenticate Apple ID") {
-                            showAppleLogin = true
-                        }
-                    } else {
-                        Button("Sign In with Apple ID") {
-                            showAppleLogin = true
-                        }
+                    } else if let user = api.user {
+                        Text(user.appleID)
+                            .font(.headline)
+                    }
+                    Button("Re-authenticate Apple ID") {
+                        showAppleLogin = true
+                    }
+                    Button("Sign Out", role: .destructive) {
+                        api.logout()
                     }
                 }
 

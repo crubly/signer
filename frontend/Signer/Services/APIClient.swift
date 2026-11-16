@@ -1,9 +1,8 @@
 import Foundation
-import AuthenticationServices
 import UIKit
 
 @MainActor
-final class APIClient: NSObject, ObservableObject, ASWebAuthenticationPresentationContextProviding {
+final class APIClient: ObservableObject {
     static let shared = APIClient()
 
     @Published var serverURL: String {
@@ -20,6 +19,7 @@ final class APIClient: NSObject, ObservableObject, ASWebAuthenticationPresentati
     }
     @Published var user: UserProfile?
     @Published var appleAccount: AppleAccount?
+    @Published var pendingSessionID: String?
     @Published var apps: [SignedApp] = []
     @Published var appIDs: [AppIDRecord] = []
     @Published var certificates: [SigningCertificate] = []
@@ -33,72 +33,18 @@ final class APIClient: NSObject, ObservableObject, ASWebAuthenticationPresentati
         return d
     }()
 
-    override init() {
+    init() {
         self.serverURL = UserDefaults.standard.string(forKey: "signer_server_url") ?? "https://sign.yourdomain.com"
         self.jwtToken = KeychainHelper.load(key: "jwt_token")
-        super.init()
-    }
-
-    nonisolated func presentationAnchor(for session: ASWebAuthenticationSession) -> ASPresentationAnchor {
-        UIApplication.shared.connectedScenes
-            .compactMap { $0 as? UIWindowScene }
-            .flatMap { $0.windows }
-            .first { $0.isKeyWindow } ?? ASPresentationAnchor()
     }
 
     var isLoggedIn: Bool {
         jwtToken != nil && !(jwtToken?.isEmpty ?? true)
     }
 
-    func signInWithGoogleWeb() async {
-        let base = serverURL.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
-        guard let url = URL(string: "\(base)/api/auth/google/start") else {
-            errorMessage = "Invalid server URL"
-            return
-        }
-        await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
-            let session = ASWebAuthenticationSession(url: url, callbackURLScheme: "signer") { [weak self] callbackURL, err in
-                Task { @MainActor in
-                    defer { cont.resume() }
-                    if let err {
-                        self?.errorMessage = err.localizedDescription
-                        return
-                    }
-                    guard let callbackURL,
-                          let comps = URLComponents(url: callbackURL, resolvingAgainstBaseURL: false),
-                          let token = comps.queryItems?.first(where: { $0.name == "token" })?.value else {
-                        self?.errorMessage = "Missing auth token from Google callback"
-                        return
-                    }
-                    self?.jwtToken = token
-                    await self?.refreshAll()
-                }
-            }
-            session.presentationContextProvider = self
-            session.prefersEphemeralWebBrowserSession = false
-            session.start()
-        }
-    }
-
-    func signInWithGoogleIDToken(_ idToken: String) async {
-        do {
-            let body = try JSONEncoder().encode(["id_token": idToken])
-            let data = try await request("POST", "/api/auth/google", body: body, auth: false)
-            struct AuthResp: Codable {
-                let token: String
-                let user: UserProfile
-            }
-            let res = try decoder.decode(AuthResp.self, from: data)
-            self.jwtToken = res.token
-            self.user = res.user
-            await refreshAll()
-        } catch {
-            self.errorMessage = error.localizedDescription
-        }
-    }
-
     func logout() {
         jwtToken = nil
+        pendingSessionID = nil
         user = nil
         appleAccount = nil
         apps = []
@@ -136,6 +82,7 @@ final class APIClient: NSObject, ObservableObject, ASWebAuthenticationPresentati
     }
 
     func appleLogin(appleID: String, password: String) async -> Bool {
+        errorMessage = nil
         do {
             let udid = UIDevice.current.identifierForVendor?.uuidString ?? UUID().uuidString
             let payload: [String: String] = [
@@ -145,18 +92,31 @@ final class APIClient: NSObject, ObservableObject, ASWebAuthenticationPresentati
                 "device_name": UIDevice.current.name
             ]
             let body = try JSONEncoder().encode(payload)
-            let data = try await request("POST", "/api/apple/login", body: body)
+            let data = try await request("POST", "/api/apple/login", body: body, auth: false)
             struct Resp: Codable {
                 let needs2FA: Bool
+                let sessionID: String?
+                let token: String?
+                let user: UserProfile?
                 let account: AppleAccount
                 enum CodingKeys: String, CodingKey {
                     case needs2FA = "needs_2fa"
-                    case account
+                    case sessionID = "session_id"
+                    case token, user, account
                 }
             }
             let res = try decoder.decode(Resp.self, from: data)
             self.appleAccount = res.account
-            return res.needs2FA
+            if res.needs2FA {
+                self.pendingSessionID = res.sessionID
+                return true
+            }
+            if let token = res.token {
+                self.jwtToken = token
+                self.user = res.user
+                await refreshAll()
+            }
+            return false
         } catch {
             self.errorMessage = error.localizedDescription
             return false
@@ -164,14 +124,25 @@ final class APIClient: NSObject, ObservableObject, ASWebAuthenticationPresentati
     }
 
     func submitApple2FA(code: String) async -> Bool {
+        errorMessage = nil
+        guard let sessionID = pendingSessionID else {
+            errorMessage = "Missing 2FA session"
+            return false
+        }
         do {
-            let body = try JSONEncoder().encode(["code": code])
-            let data = try await request("POST", "/api/apple/2fa", body: body)
+            let body = try JSONEncoder().encode(["session_id": sessionID, "code": code])
+            let data = try await request("POST", "/api/apple/2fa", body: body, auth: false)
             struct Resp: Codable {
+                let token: String
+                let user: UserProfile
                 let account: AppleAccount
             }
             let res = try decoder.decode(Resp.self, from: data)
+            self.pendingSessionID = nil
+            self.jwtToken = res.token
+            self.user = res.user
             self.appleAccount = res.account
+            await refreshAll()
             return true
         } catch {
             self.errorMessage = error.localizedDescription

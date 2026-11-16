@@ -23,13 +23,11 @@ import (
 )
 
 type Config struct {
-	DataDir            string
-	ZsignBin           string
-	JWTSecret          string
-	GoogleClientID     string
-	GoogleClientSecret string
-	PublicURL          string
-	AnisetteURL        string
+	DataDir     string
+	ZsignBin    string
+	JWTSecret   string
+	PublicURL   string
+	AnisetteURL string
 }
 
 type Server struct {
@@ -56,16 +54,13 @@ func (s *Server) Handler() http.Handler {
 
 	mux.HandleFunc("GET /health", s.handleHealth)
 
-	// Google Auth
-	mux.HandleFunc("POST /api/auth/google", s.handleGoogleTokenAuth)
-	mux.HandleFunc("GET /api/auth/google/start", s.handleGoogleOAuthStart)
-	mux.HandleFunc("GET /api/auth/google/callback", s.handleGoogleOAuthCallback)
+	// Apple ID Primary Auth (no JWT required)
+	mux.HandleFunc("POST /api/apple/login", s.handleAppleLogin)
+	mux.HandleFunc("POST /api/apple/2fa", s.handleApple2FA)
 	mux.Handle("GET /api/auth/me", s.requireAuth(http.HandlerFunc(s.handleMe)))
 
-	// Apple Account
+	// Apple Developer Account & App IDs
 	mux.Handle("GET /api/apple/account", s.requireAuth(http.HandlerFunc(s.handleGetAppleAccount)))
-	mux.Handle("POST /api/apple/login", s.requireAuth(http.HandlerFunc(s.handleAppleLogin)))
-	mux.Handle("POST /api/apple/2fa", s.requireAuth(http.HandlerFunc(s.handleApple2FA)))
 	mux.Handle("GET /api/apple/app-ids", s.requireAuth(http.HandlerFunc(s.handleListAppIDs)))
 	mux.Handle("DELETE /api/apple/app-ids/{id}", s.requireAuth(http.HandlerFunc(s.handleDeleteAppID)))
 
@@ -153,156 +148,6 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-type googleInfo struct {
-	Sub     string `json:"sub"`
-	Email   string `json:"email"`
-	Name    string `json:"name"`
-	Picture string `json:"picture"`
-	Aud     string `json:"aud"`
-}
-
-func (s *Server) handleGoogleTokenAuth(w http.ResponseWriter, r *http.Request) {
-	var body struct {
-		IDToken     string `json:"id_token"`
-		AccessToken string `json:"access_token"`
-	}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		writeErr(w, http.StatusBadRequest, "invalid json")
-		return
-	}
-
-	var info googleInfo
-	if body.IDToken != "" {
-		resp, err := http.Get("https://oauth2.googleapis.com/tokeninfo?id_token=" + url.QueryEscape(body.IDToken))
-		if err != nil {
-			writeErr(w, http.StatusBadGateway, "google verification failed")
-			return
-		}
-		defer resp.Body.Close()
-		if resp.StatusCode != 200 {
-			writeErr(w, http.StatusUnauthorized, "invalid google id_token")
-			return
-		}
-		if err := json.NewDecoder(resp.Body).Decode(&info); err != nil {
-			writeErr(w, http.StatusBadGateway, "google decode error")
-			return
-		}
-	} else if body.AccessToken != "" {
-		req, _ := http.NewRequest(http.MethodGet, "https://www.googleapis.com/oauth2/v3/userinfo", nil)
-		req.Header.Set("Authorization", "Bearer "+body.AccessToken)
-		resp, err := http.DefaultClient.Do(req)
-		if err != nil || resp.StatusCode != 200 {
-			writeErr(w, http.StatusUnauthorized, "invalid google access_token")
-			return
-		}
-		defer resp.Body.Close()
-		_ = json.NewDecoder(resp.Body).Decode(&info)
-	} else {
-		writeErr(w, http.StatusBadRequest, "id_token or access_token required")
-		return
-	}
-
-	if info.Sub == "" || info.Email == "" {
-		writeErr(w, http.StatusUnauthorized, "incomplete google profile")
-		return
-	}
-	if s.cfg.GoogleClientID != "" && info.Aud != "" && info.Aud != s.cfg.GoogleClientID {
-		writeErr(w, http.StatusUnauthorized, "google client_id mismatch")
-		return
-	}
-
-	user, err := s.store.UpsertGoogleUser(uuid.NewString(), info.Sub, info.Email, info.Name, info.Picture)
-	if err != nil {
-		writeErr(w, http.StatusInternalServerError, err.Error())
-		return
-	}
-	tok, err := s.issueJWT(user.ID)
-	if err != nil {
-		writeErr(w, http.StatusInternalServerError, err.Error())
-		return
-	}
-	writeJSON(w, http.StatusOK, map[string]any{
-		"token": tok,
-		"user":  user,
-	})
-}
-
-func (s *Server) handleGoogleOAuthStart(w http.ResponseWriter, r *http.Request) {
-	if s.cfg.GoogleClientID == "" {
-		writeErr(w, http.StatusBadRequest, "GOOGLE_CLIENT_ID not configured on server")
-		return
-	}
-	redirectURI := strings.TrimRight(s.effectivePublicURL(r), "/") + "/api/auth/google/callback"
-	state := r.URL.Query().Get("state")
-	if state == "" {
-		state = uuid.NewString()
-	}
-	authURL := fmt.Sprintf(
-		"https://accounts.google.com/o/oauth2/v2/auth?client_id=%s&redirect_uri=%s&response_type=code&scope=%s&access_type=offline&prompt=select_account&state=%s",
-		url.QueryEscape(s.cfg.GoogleClientID),
-		url.QueryEscape(redirectURI),
-		url.QueryEscape("openid email profile"),
-		url.QueryEscape(state),
-	)
-	http.Redirect(w, r, authURL, http.StatusFound)
-}
-
-func (s *Server) handleGoogleOAuthCallback(w http.ResponseWriter, r *http.Request) {
-	code := r.URL.Query().Get("code")
-	if code == "" {
-		writeErr(w, http.StatusBadRequest, "missing code")
-		return
-	}
-	redirectURI := strings.TrimRight(s.effectivePublicURL(r), "/") + "/api/auth/google/callback"
-	form := url.Values{
-		"code":          {code},
-		"client_id":     {s.cfg.GoogleClientID},
-		"client_secret": {s.cfg.GoogleClientSecret},
-		"redirect_uri":  {redirectURI},
-		"grant_type":    {"authorization_code"},
-	}
-	resp, err := http.PostForm("https://oauth2.googleapis.com/token", form)
-	if err != nil {
-		writeErr(w, http.StatusBadGateway, err.Error())
-		return
-	}
-	defer resp.Body.Close()
-	var tokResp struct {
-		IDToken     string `json:"id_token"`
-		AccessToken string `json:"access_token"`
-	}
-	_ = json.NewDecoder(resp.Body).Decode(&tokResp)
-	if tokResp.AccessToken == "" {
-		writeErr(w, http.StatusUnauthorized, "failed to exchange google code")
-		return
-	}
-
-	req, _ := http.NewRequest(http.MethodGet, "https://www.googleapis.com/oauth2/v3/userinfo", nil)
-	req.Header.Set("Authorization", "Bearer "+tokResp.AccessToken)
-	uResp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		writeErr(w, http.StatusBadGateway, err.Error())
-		return
-	}
-	defer uResp.Body.Close()
-	var info googleInfo
-	_ = json.NewDecoder(uResp.Body).Decode(&info)
-
-	user, err := s.store.UpsertGoogleUser(uuid.NewString(), info.Sub, info.Email, info.Name, info.Picture)
-	if err != nil {
-		writeErr(w, http.StatusInternalServerError, err.Error())
-		return
-	}
-	jwtTok, err := s.issueJWT(user.ID)
-	if err != nil {
-		writeErr(w, http.StatusInternalServerError, err.Error())
-		return
-	}
-	deepLink := fmt.Sprintf("signer://auth?token=%s&email=%s&name=%s",
-		url.QueryEscape(jwtTok), url.QueryEscape(user.Email), url.QueryEscape(user.Name))
-	http.Redirect(w, r, deepLink, http.StatusFound)
-}
-
 func (s *Server) handleMe(w http.ResponseWriter, r *http.Request) {
 	uid := currentUserID(r)
 	u, err := s.store.GetUserByID(uid)
@@ -331,7 +176,6 @@ func (s *Server) handleGetAppleAccount(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleAppleLogin(w http.ResponseWriter, r *http.Request) {
-	uid := currentUserID(r)
 	var body struct {
 		AppleID    string `json:"apple_id"`
 		Password   string `json:"password"`
@@ -342,23 +186,28 @@ func (s *Server) handleAppleLogin(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "invalid json")
 		return
 	}
-	if body.AppleID == "" || body.Password == "" {
+	appleID := strings.TrimSpace(strings.ToLower(body.AppleID))
+	if appleID == "" || body.Password == "" {
 		writeErr(w, http.StatusBadRequest, "apple_id and password required")
 		return
 	}
 
-	settings, _ := s.store.GetSettings(uid)
-	s.apple.SetAnisetteURL(settings.AnisetteURL)
-
-	res, pending, err := s.apple.StartLogin(body.AppleID, body.Password)
+	s.apple.SetAnisetteURL(s.cfg.AnisetteURL)
+	res, pending, err := s.apple.StartLogin(appleID, body.Password)
 	if err != nil {
 		writeErr(w, http.StatusUnauthorized, err.Error())
 		return
 	}
 
+	user, err := s.store.UpsertAppleUser(uuid.NewString(), appleID, res.DSID)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
 	acc := store.Account{
-		UserID:     uid,
-		AppleID:    body.AppleID,
+		UserID:     user.ID,
+		AppleID:    appleID,
 		DSID:       res.DSID,
 		GSToken:    res.GSToken,
 		DeviceUDID: body.DeviceUDID,
@@ -368,36 +217,45 @@ func (s *Server) handleAppleLogin(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if res.Needs2FA {
+		sessionID := uuid.NewString()
 		s.pendingMu.Lock()
-		s.pendingAuth[uid] = pending
+		s.pendingAuth[sessionID] = pending
 		s.pendingMu.Unlock()
 		_ = s.store.SaveAppleAccount(acc)
 		writeJSON(w, http.StatusOK, map[string]any{
-			"needs_2fa": true,
-			"account":   acc,
+			"needs_2fa":  true,
+			"session_id": sessionID,
+			"account":    acc,
 		})
 		return
 	}
 
-	s.syncTeamsAndSave(uid, &acc, res.Anisette)
+	s.syncTeamsAndSave(user.ID, &acc, res.Anisette)
+	tok, err := s.issueJWT(user.ID)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"needs_2fa": false,
+		"token":     tok,
+		"user":      user,
 		"account":   acc,
 	})
 }
 
 func (s *Server) handleApple2FA(w http.ResponseWriter, r *http.Request) {
-	uid := currentUserID(r)
 	var body struct {
-		Code string `json:"code"`
+		SessionID string `json:"session_id"`
+		Code      string `json:"code"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil || len(body.Code) != 6 {
-		writeErr(w, http.StatusBadRequest, "6-digit code required")
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil || len(body.Code) != 6 || body.SessionID == "" {
+		writeErr(w, http.StatusBadRequest, "session_id and 6-digit code required")
 		return
 	}
 
 	s.pendingMu.Lock()
-	pending := s.pendingAuth[uid]
+	pending := s.pendingAuth[body.SessionID]
 	s.pendingMu.Unlock()
 	if pending == nil {
 		writeErr(w, http.StatusBadRequest, "no pending 2FA session")
@@ -411,21 +269,35 @@ func (s *Server) handleApple2FA(w http.ResponseWriter, r *http.Request) {
 	}
 
 	s.pendingMu.Lock()
-	delete(s.pendingAuth, uid)
+	delete(s.pendingAuth, body.SessionID)
 	s.pendingMu.Unlock()
 
-	acc, _ := s.store.GetAppleAccount(uid)
+	user, err := s.store.UpsertAppleUser(uuid.NewString(), strings.ToLower(pending.AppleID), res.DSID)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	acc, _ := s.store.GetAppleAccount(user.ID)
 	if acc == nil {
-		acc = &store.Account{UserID: uid, AppleID: pending.AppleID}
+		acc = &store.Account{UserID: user.ID, AppleID: strings.ToLower(pending.AppleID)}
 	}
 	acc.DSID = res.DSID
 	acc.GSToken = res.GSToken
 	acc.Needs2FA = false
 	acc.LoggedIn = true
-	s.syncTeamsAndSave(uid, acc, res.Anisette)
+	s.syncTeamsAndSave(user.ID, acc, res.Anisette)
+
+	tok, err := s.issueJWT(user.ID)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
 
 	writeJSON(w, http.StatusOK, map[string]any{
 		"needs_2fa": false,
+		"token":     tok,
+		"user":      user,
 		"account":   acc,
 	})
 }

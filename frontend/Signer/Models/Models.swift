@@ -2,16 +2,12 @@ import Foundation
 
 struct UserProfile: Codable, Identifiable {
     let id: String
-    let googleSub: String
-    let email: String
-    let name: String
-    let avatarURL: String
+    let appleID: String
+    let dsid: String
 
     enum CodingKeys: String, CodingKey {
-        case id
-        case googleSub = "google_sub"
-        case email, name
-        case avatarURL = "avatar_url"
+        case id, dsid
+        case appleID = "apple_id"
     }
 }
 

@@ -2,49 +2,76 @@ import SwiftUI
 
 struct LoginView: View {
     @EnvironmentObject var api: APIClient
+    @State private var appleID = ""
+    @State private var password = ""
+    @State private var code2FA = ""
+    @State private var needs2FA = false
     @State private var isLoading = false
-    @State private var manualIDToken = ""
-    @State private var showManualToken = false
 
     var body: some View {
         NavigationStack {
-            VStack(spacing: 24) {
+            VStack(spacing: 22) {
                 Spacer()
 
                 Image(systemName: "signature")
-                    .font(.system(size: 64, weight: .bold))
+                    .font(.system(size: 60, weight: .bold))
                     .foregroundStyle(.blue.gradient)
 
-                VStack(spacing: 8) {
+                VStack(spacing: 6) {
                     Text("Signer")
                         .font(.largeTitle.bold())
-                    Text("Remote iOS App Signing & Renewal")
+                    Text("Sign in with your Apple ID to sign & renew apps")
                         .font(.subheadline)
                         .foregroundStyle(.secondary)
+                        .multilineTextAlignment(.center)
                 }
+                .padding(.horizontal)
 
-                VStack(alignment: .leading, spacing: 8) {
-                    Text("Backend Server URL")
-                        .font(.caption.weight(.semibold))
-                        .foregroundStyle(.secondary)
-                    TextField("https://sign.yourdomain.com", text: $api.serverURL)
+                VStack(spacing: 12) {
+                    TextField("Server URL (https://sign.yourdomain.com)", text: $api.serverURL)
                         .textFieldStyle(.roundedBorder)
                         .keyboardType(.URL)
                         .autocorrectionDisabled()
                         .textInputAutocapitalization(.never)
+
+                    if !needs2FA {
+                        TextField("Apple ID Email", text: $appleID)
+                            .textFieldStyle(.roundedBorder)
+                            .keyboardType(.emailAddress)
+                            .autocorrectionDisabled()
+                            .textInputAutocapitalization(.never)
+
+                        SecureField("Apple ID Password", text: $password)
+                            .textFieldStyle(.roundedBorder)
+                    } else {
+                        Text("Enter the 6-digit 2FA code sent to your trusted device.")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                        TextField("6-digit 2FA Code", text: $code2FA)
+                            .textFieldStyle(.roundedBorder)
+                            .keyboardType(.numberPad)
+                            .multilineTextAlignment(.center)
+                    }
                 }
                 .padding(.horizontal)
 
                 Button {
                     Task {
                         isLoading = true
-                        await api.signInWithGoogleWeb()
+                        if !needs2FA {
+                            let twoFA = await api.appleLogin(appleID: appleID, password: password)
+                            if twoFA {
+                                needs2FA = true
+                            }
+                        } else {
+                            _ = await api.submitApple2FA(code: code2FA)
+                        }
                         isLoading = false
                     }
                 } label: {
                     HStack {
-                        Image(systemName: "person.badge.key.fill")
-                        Text(isLoading ? "Connecting..." : "Continue with Google")
+                        Image(systemName: "apple.logo")
+                        Text(isLoading ? "Signing in..." : (needs2FA ? "Verify 2FA Code" : "Sign In with Apple ID"))
                             .fontWeight(.semibold)
                     }
                     .frame(maxWidth: .infinity)
@@ -53,30 +80,15 @@ struct LoginView: View {
                     .foregroundStyle(.white)
                     .clipShape(RoundedRectangle(cornerRadius: 14))
                 }
-                .disabled(isLoading)
+                .disabled(isLoading || (!needs2FA && (appleID.isEmpty || password.isEmpty)) || (needs2FA && code2FA.count != 6))
                 .padding(.horizontal)
 
-                Button("Use Google ID Token") {
-                    showManualToken.toggle()
-                }
-                .font(.footnote)
-                .foregroundStyle(.secondary)
-
-                if showManualToken {
-                    VStack(spacing: 10) {
-                        TextField("Paste Google ID Token", text: $manualIDToken)
-                            .textFieldStyle(.roundedBorder)
-                            .textInputAutocapitalization(.never)
-                        Button("Verify Token") {
-                            Task {
-                                isLoading = true
-                                await api.signInWithGoogleIDToken(manualIDToken)
-                                isLoading = false
-                            }
-                        }
-                        .buttonStyle(.borderedProminent)
+                if needs2FA {
+                    Button("Back to Apple ID") {
+                        needs2FA = false
+                        code2FA = ""
                     }
-                    .padding(.horizontal)
+                    .font(.footnote)
                 }
 
                 if let err = api.errorMessage {
@@ -89,7 +101,7 @@ struct LoginView: View {
 
                 Spacer()
             }
-            .navigationTitle("Welcome")
+            .navigationTitle("Sign In")
             .navigationBarTitleDisplayMode(.inline)
         }
     }

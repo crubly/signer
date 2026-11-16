@@ -37,8 +37,6 @@ services:
       JWT_SECRET: ${JWT_SECRET}
       PUBLIC_URL: ${PUBLIC_URL:-}
       ANISETTE_URL: ${ANISETTE_URL:-https://ani.sidestore.io}
-      GOOGLE_CLIENT_ID: ${GOOGLE_CLIENT_ID:-}
-      GOOGLE_CLIENT_SECRET: ${GOOGLE_CLIENT_SECRET:-}
 
   cloudflared:
     image: cloudflare/cloudflared:latest

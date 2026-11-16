@@ -12,10 +12,8 @@ import (
 
 type User struct {
 	ID        string    `json:"id"`
-	GoogleSub string    `json:"google_sub"`
-	Email     string    `json:"email"`
-	Name      string    `json:"name"`
-	AvatarURL string    `json:"avatar_url"`
+	AppleID   string    `json:"apple_id"`
+	DSID      string    `json:"dsid"`
 	CreatedAt time.Time `json:"created_at"`
 }
 
@@ -135,10 +133,8 @@ func (s *Store) migrate() error {
 	schema := `
 	CREATE TABLE IF NOT EXISTS users (
 		id TEXT PRIMARY KEY,
-		google_sub TEXT UNIQUE NOT NULL,
-		email TEXT NOT NULL,
-		name TEXT NOT NULL DEFAULT '',
-		avatar_url TEXT NOT NULL DEFAULT '',
+		apple_id TEXT UNIQUE NOT NULL,
+		dsid TEXT NOT NULL DEFAULT '',
 		created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 	);
 
@@ -229,15 +225,15 @@ func (s *Store) migrate() error {
 	return err
 }
 
-func (s *Store) UpsertGoogleUser(id, googleSub, email, name, avatar string) (User, error) {
+func (s *Store) UpsertAppleUser(id, appleID, dsid string) (User, error) {
 	var u User
 	err := s.db.QueryRow(`
-		INSERT INTO users (id, google_sub, email, name, avatar_url)
-		VALUES ($1, $2, $3, $4, $5)
-		ON CONFLICT (google_sub) DO UPDATE
-		SET email = EXCLUDED.email, name = EXCLUDED.name, avatar_url = EXCLUDED.avatar_url
-		RETURNING id, google_sub, email, name, avatar_url, created_at
-	`, id, googleSub, email, name, avatar).Scan(&u.ID, &u.GoogleSub, &u.Email, &u.Name, &u.AvatarURL, &u.CreatedAt)
+		INSERT INTO users (id, apple_id, dsid)
+		VALUES ($1, $2, $3)
+		ON CONFLICT (apple_id) DO UPDATE
+		SET dsid = CASE WHEN EXCLUDED.dsid <> '' THEN EXCLUDED.dsid ELSE users.dsid END
+		RETURNING id, apple_id, dsid, created_at
+	`, id, appleID, dsid).Scan(&u.ID, &u.AppleID, &u.DSID, &u.CreatedAt)
 	if err != nil {
 		return u, err
 	}
@@ -251,8 +247,8 @@ func (s *Store) UpsertGoogleUser(id, googleSub, email, name, avatar string) (Use
 
 func (s *Store) GetUserByID(id string) (User, error) {
 	var u User
-	err := s.db.QueryRow(`SELECT id, google_sub, email, name, avatar_url, created_at FROM users WHERE id = $1`, id).
-		Scan(&u.ID, &u.GoogleSub, &u.Email, &u.Name, &u.AvatarURL, &u.CreatedAt)
+	err := s.db.QueryRow(`SELECT id, apple_id, dsid, created_at FROM users WHERE id = $1`, id).
+		Scan(&u.ID, &u.AppleID, &u.DSID, &u.CreatedAt)
 	return u, err
 }
 

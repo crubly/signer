@@ -25,8 +25,6 @@ func main() {
 	zsignBin := envOr("ZSIGN_BIN", "zsign")
 	publicURL := os.Getenv("PUBLIC_URL")
 	anisetteURL := envOr("ANISETTE_URL", "https://ani.sidestore.io")
-	googleClientID := os.Getenv("GOOGLE_CLIENT_ID")
-	googleClientSecret := os.Getenv("GOOGLE_CLIENT_SECRET")
 
 	cipher := crypto.NewCipher(encKey)
 	st, err := store.NewPostgres(dsn, cipher, publicURL, anisetteURL)
@@ -42,13 +40,11 @@ func main() {
 	go disp.Start(ctx)
 
 	srv := api.NewServer(api.Config{
-		DataDir:            dataDir,
-		ZsignBin:           zsignBin,
-		JWTSecret:          jwtSecret,
-		GoogleClientID:     googleClientID,
-		GoogleClientSecret: googleClientSecret,
-		PublicURL:          publicURL,
-		AnisetteURL:        anisetteURL,
+		DataDir:     dataDir,
+		ZsignBin:    zsignBin,
+		JWTSecret:   jwtSecret,
+		PublicURL:   publicURL,
+		AnisetteURL: anisetteURL,
 	}, st, ap, disp)
 
 	httpSrv := &http.Server{
