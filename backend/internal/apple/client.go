@@ -208,9 +208,12 @@ func (c *Client) startLoginWithAnisette(appleID, password string, anisette Anise
 		},
 	}
 
-	respMap, cookies, err := c.postGSAPlist(initPayload, anisette)
+	respMap, cookies, err := c.postGSAPlistWithCookies(initPayload, anisette, extraCookies)
 	if err != nil {
 		return nil, nil, err
+	}
+	if len(extraCookies) > 0 {
+		cookies = append(extraCookies, cookies...)
 	}
 
 	respDict, ok := respMap["Response"].(map[string]any)
@@ -308,7 +311,7 @@ func (c *Client) startLoginWithAnisette(appleID, password string, anisette Anise
 		},
 	}
 
-	compMap, compCookies, err := c.postGSAPlist(completePayload, anisette)
+	compMap, compCookies, err := c.postGSAPlistWithCookies(completePayload, anisette, cookies)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -426,17 +429,24 @@ func (c *Client) Submit2FA(p *PendingAuth, code string) (*AuthResult, error) {
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
 		return nil, fmt.Errorf("2FA verification failed (HTTP %d): %s", resp.StatusCode, string(body))
 	}
+	allCookies := append([]*http.Cookie(nil), p.Cookies...)
+	allCookies = append(allCookies, resp.Cookies()...)
 	cookieMap := map[string]string{}
-	for _, ck := range resp.Cookies() {
+	for _, ck := range allCookies {
 		cookieMap[ck.Name] = ck.Value
 	}
+
+	// Re-run SRP with the 2FA-verified cookies & same Anisette to obtain post-2FA GsIdmsToken + Xcode app token
+	res2, _, err2 := c.startLoginWithAnisette(p.AppleID, p.Password, p.Anisette, allCookies)
+	if err2 == nil && !res2.Needs2FA && res2.GSToken != "" {
+		return res2, nil
+	}
+	log.Printf("post-2FA SRP retry result: err=%v, needs2FA=%v", err2, res2 != nil && res2.Needs2FA)
+
 	gsToken := p.IDMSToken
 	xcodeTok, err := c.fetchXcodeGSToken(p.DSID, p.IDMSToken, p.SessionKey, p.Anisette)
 	if err != nil {
-		log.Printf("fetchXcodeGSToken after 2FA failed (%v), retrying SRP with trusted session", err)
-		if res2, _, err2 := c.startLoginWithAnisette(p.AppleID, p.Password, p.Anisette, p.Cookies); err2 == nil && !res2.Needs2FA && res2.GSToken != "" {
-			return res2, nil
-		}
+		log.Printf("fetchXcodeGSToken after 2FA failed: %v", err)
 	} else if xcodeTok != "" {
 		gsToken = xcodeTok
 	}
@@ -704,6 +714,10 @@ func GenerateCSR(commonName string) (privateKeyPEM []byte, csrPEM []byte, err er
 }
 
 func (c *Client) postGSAPlist(payload map[string]any, anisette AnisetteHeaders) (map[string]any, []*http.Cookie, error) {
+	return c.postGSAPlistWithCookies(payload, anisette, nil)
+}
+
+func (c *Client) postGSAPlistWithCookies(payload map[string]any, anisette AnisetteHeaders, cookies []*http.Cookie) (map[string]any, []*http.Cookie, error) {
 	var buf bytes.Buffer
 	enc := plist.NewEncoder(&buf)
 	if err := enc.Encode(payload); err != nil {
@@ -717,6 +731,9 @@ func (c *Client) postGSAPlist(payload map[string]any, anisette AnisetteHeaders) 
 	req.Header.Set("Accept", "*/*")
 	req.Header.Set("User-Agent", "akd/1.0 CFNetwork/1404.0.5 Darwin/22.3.0")
 	c.applyAnisetteHeaders(req, anisette)
+	for _, ck := range cookies {
+		req.AddCookie(ck)
+	}
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
