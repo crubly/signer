@@ -1,0 +1,52 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: signer-postgres
+    restart: always
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-signer}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-signer_secret_change_me}
+      POSTGRES_DB: ${POSTGRES_DB:-signer}
+    volumes:
+      - ./pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-signer} -d ${POSTGRES_DB:-signer}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: signer-backend
+    restart: always
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      - "8095:8095"
+    volumes:
+      - ./data:/data
+    environment:
+      PORT: "8095"
+      DATA_DIR: "/data"
+      ZSIGN_BIN: "zsign"
+      DATABASE_URL: "postgres://${POSTGRES_USER:-signer}:${POSTGRES_PASSWORD:-signer_secret_change_me}@postgres:5432/${POSTGRES_DB:-signer}?sslmode=disable"
+      ENCRYPTION_KEY: ${ENCRYPTION_KEY}
+      JWT_SECRET: ${JWT_SECRET}
+      PUBLIC_URL: ${PUBLIC_URL:-}
+      ANISETTE_URL: ${ANISETTE_URL:-https://ani.sidestore.io}
+      GOOGLE_CLIENT_ID: ${GOOGLE_CLIENT_ID:-}
+      GOOGLE_CLIENT_SECRET: ${GOOGLE_CLIENT_SECRET:-}
+
+  cloudflared:
+    image: cloudflare/cloudflared:latest
+    container_name: signer-cloudflared
+    restart: always
+    depends_on:
+      - backend
+    profiles: ["tunnel"]
+    volumes:
+      - ${HOME}/.cloudflared:/etc/cloudflared:ro
+    command: tunnel --no-autoupdate --config /etc/cloudflared/config.yml run

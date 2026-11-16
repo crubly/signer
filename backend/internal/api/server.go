@@ -1,0 +1,899 @@
+package api
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"net/http"
+	"net/url"
+	"os"
+	"path/filepath"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/crubly/signer-backend/internal/apple"
+	"github.com/crubly/signer-backend/internal/notify"
+	"github.com/crubly/signer-backend/internal/signer"
+	"github.com/crubly/signer-backend/internal/store"
+	"github.com/golang-jwt/jwt/v5"
+	"github.com/google/uuid"
+)
+
+type Config struct {
+	DataDir            string
+	ZsignBin           string
+	JWTSecret          string
+	GoogleClientID     string
+	GoogleClientSecret string
+	PublicURL          string
+	AnisetteURL        string
+}
+
+type Server struct {
+	cfg         Config
+	store       *store.Store
+	apple       *apple.Client
+	notifier    *notify.Dispatcher
+	pendingMu   sync.Mutex
+	pendingAuth map[string]*apple.PendingAuth
+}
+
+func NewServer(cfg Config, st *store.Store, ap *apple.Client, disp *notify.Dispatcher) *Server {
+	return &Server{
+		cfg:         cfg,
+		store:       st,
+		apple:       ap,
+		notifier:    disp,
+		pendingAuth: map[string]*apple.PendingAuth{},
+	}
+}
+
+func (s *Server) Handler() http.Handler {
+	mux := http.NewServeMux()
+
+	mux.HandleFunc("GET /health", s.handleHealth)
+
+	// Google Auth
+	mux.HandleFunc("POST /api/auth/google", s.handleGoogleTokenAuth)
+	mux.HandleFunc("GET /api/auth/google/start", s.handleGoogleOAuthStart)
+	mux.HandleFunc("GET /api/auth/google/callback", s.handleGoogleOAuthCallback)
+	mux.Handle("GET /api/auth/me", s.requireAuth(http.HandlerFunc(s.handleMe)))
+
+	// Apple Account
+	mux.Handle("GET /api/apple/account", s.requireAuth(http.HandlerFunc(s.handleGetAppleAccount)))
+	mux.Handle("POST /api/apple/login", s.requireAuth(http.HandlerFunc(s.handleAppleLogin)))
+	mux.Handle("POST /api/apple/2fa", s.requireAuth(http.HandlerFunc(s.handleApple2FA)))
+	mux.Handle("GET /api/apple/app-ids", s.requireAuth(http.HandlerFunc(s.handleListAppIDs)))
+	mux.Handle("DELETE /api/apple/app-ids/{id}", s.requireAuth(http.HandlerFunc(s.handleDeleteAppID)))
+
+	// Certificates
+	mux.Handle("GET /api/certs", s.requireAuth(http.HandlerFunc(s.handleListCerts)))
+	mux.Handle("POST /api/certs/upload", s.requireAuth(http.HandlerFunc(s.handleUploadCert)))
+
+	// Apps & Signing
+	mux.Handle("GET /api/apps", s.requireAuth(http.HandlerFunc(s.handleListApps)))
+	mux.Handle("POST /api/apps/upload", s.requireAuth(http.HandlerFunc(s.handleUploadIPA)))
+	mux.Handle("POST /api/apps/from-url", s.requireAuth(http.HandlerFunc(s.handleIPAFromURL)))
+	mux.Handle("POST /api/apps/{id}/sign", s.requireAuth(http.HandlerFunc(s.handleSignApp)))
+	mux.Handle("POST /api/apps/{id}/renew", s.requireAuth(http.HandlerFunc(s.handleRenewApp)))
+	mux.Handle("DELETE /api/apps/{id}", s.requireAuth(http.HandlerFunc(s.handleDeleteApp)))
+
+	// Public OTA manifest & IPA download (for iOS itms-services://)
+	mux.HandleFunc("GET /ota/{id}/manifest.plist", s.handleOTAManifest)
+	mux.HandleFunc("GET /ota/{id}/app.ipa", s.handleOTAIPA)
+
+	// Notifications & Settings
+	mux.Handle("GET /api/notifications", s.requireAuth(http.HandlerFunc(s.handleListNotifications)))
+	mux.Handle("POST /api/notifications/read", s.requireAuth(http.HandlerFunc(s.handleMarkNotificationsRead)))
+	mux.Handle("POST /api/notifications/test", s.requireAuth(http.HandlerFunc(s.handleTestNotification)))
+	mux.Handle("GET /api/settings", s.requireAuth(http.HandlerFunc(s.handleGetSettings)))
+	mux.Handle("PUT /api/settings", s.requireAuth(http.HandlerFunc(s.handleUpdateSettings)))
+
+	return corsMiddleware(mux)
+}
+
+type ctxKey string
+
+const userIDKey ctxKey = "user_id"
+
+func (s *Server) requireAuth(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		auth := r.Header.Get("Authorization")
+		if !strings.HasPrefix(auth, "Bearer ") {
+			writeErr(w, http.StatusUnauthorized, "missing bearer token")
+			return
+		}
+		tokStr := strings.TrimPrefix(auth, "Bearer ")
+		tok, err := jwt.Parse(tokStr, func(t *jwt.Token) (any, error) {
+			if _, ok := t.Method.(*jwt.SigningMethodHMAC); !ok {
+				return nil, errors.New("unexpected signing method")
+			}
+			return []byte(s.cfg.JWTSecret), nil
+		})
+		if err != nil || !tok.Valid {
+			writeErr(w, http.StatusUnauthorized, "invalid token")
+			return
+		}
+		claims, ok := tok.Claims.(jwt.MapClaims)
+		if !ok {
+			writeErr(w, http.StatusUnauthorized, "invalid claims")
+			return
+		}
+		uid, _ := claims["sub"].(string)
+		if uid == "" {
+			writeErr(w, http.StatusUnauthorized, "missing subject")
+			return
+		}
+		ctx := context.WithValue(r.Context(), userIDKey, uid)
+		next.ServeHTTP(w, r.WithContext(ctx))
+	})
+}
+
+func currentUserID(r *http.Request) string {
+	v, _ := r.Context().Value(userIDKey).(string)
+	return v
+}
+
+func (s *Server) issueJWT(userID string) (string, error) {
+	claims := jwt.MapClaims{
+		"sub": userID,
+		"iat": time.Now().Unix(),
+		"exp": time.Now().Add(30 * 24 * time.Hour).Unix(),
+	}
+	return jwt.NewWithClaims(jwt.SigningMethodHS256, claims).SignedString([]byte(s.cfg.JWTSecret))
+}
+
+func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok":   true,
+		"time": time.Now().UTC(),
+	})
+}
+
+type googleInfo struct {
+	Sub     string `json:"sub"`
+	Email   string `json:"email"`
+	Name    string `json:"name"`
+	Picture string `json:"picture"`
+	Aud     string `json:"aud"`
+}
+
+func (s *Server) handleGoogleTokenAuth(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		IDToken     string `json:"id_token"`
+		AccessToken string `json:"access_token"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeErr(w, http.StatusBadRequest, "invalid json")
+		return
+	}
+
+	var info googleInfo
+	if body.IDToken != "" {
+		resp, err := http.Get("https://oauth2.googleapis.com/tokeninfo?id_token=" + url.QueryEscape(body.IDToken))
+		if err != nil {
+			writeErr(w, http.StatusBadGateway, "google verification failed")
+			return
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode != 200 {
+			writeErr(w, http.StatusUnauthorized, "invalid google id_token")
+			return
+		}
+		if err := json.NewDecoder(resp.Body).Decode(&info); err != nil {
+			writeErr(w, http.StatusBadGateway, "google decode error")
+			return
+		}
+	} else if body.AccessToken != "" {
+		req, _ := http.NewRequest(http.MethodGet, "https://www.googleapis.com/oauth2/v3/userinfo", nil)
+		req.Header.Set("Authorization", "Bearer "+body.AccessToken)
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil || resp.StatusCode != 200 {
+			writeErr(w, http.StatusUnauthorized, "invalid google access_token")
+			return
+		}
+		defer resp.Body.Close()
+		_ = json.NewDecoder(resp.Body).Decode(&info)
+	} else {
+		writeErr(w, http.StatusBadRequest, "id_token or access_token required")
+		return
+	}
+
+	if info.Sub == "" || info.Email == "" {
+		writeErr(w, http.StatusUnauthorized, "incomplete google profile")
+		return
+	}
+	if s.cfg.GoogleClientID != "" && info.Aud != "" && info.Aud != s.cfg.GoogleClientID {
+		writeErr(w, http.StatusUnauthorized, "google client_id mismatch")
+		return
+	}
+
+	user, err := s.store.UpsertGoogleUser(uuid.NewString(), info.Sub, info.Email, info.Name, info.Picture)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	tok, err := s.issueJWT(user.ID)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"token": tok,
+		"user":  user,
+	})
+}
+
+func (s *Server) handleGoogleOAuthStart(w http.ResponseWriter, r *http.Request) {
+	if s.cfg.GoogleClientID == "" {
+		writeErr(w, http.StatusBadRequest, "GOOGLE_CLIENT_ID not configured on server")
+		return
+	}
+	redirectURI := strings.TrimRight(s.effectivePublicURL(r), "/") + "/api/auth/google/callback"
+	state := r.URL.Query().Get("state")
+	if state == "" {
+		state = uuid.NewString()
+	}
+	authURL := fmt.Sprintf(
+		"https://accounts.google.com/o/oauth2/v2/auth?client_id=%s&redirect_uri=%s&response_type=code&scope=%s&access_type=offline&prompt=select_account&state=%s",
+		url.QueryEscape(s.cfg.GoogleClientID),
+		url.QueryEscape(redirectURI),
+		url.QueryEscape("openid email profile"),
+		url.QueryEscape(state),
+	)
+	http.Redirect(w, r, authURL, http.StatusFound)
+}
+
+func (s *Server) handleGoogleOAuthCallback(w http.ResponseWriter, r *http.Request) {
+	code := r.URL.Query().Get("code")
+	if code == "" {
+		writeErr(w, http.StatusBadRequest, "missing code")
+		return
+	}
+	redirectURI := strings.TrimRight(s.effectivePublicURL(r), "/") + "/api/auth/google/callback"
+	form := url.Values{
+		"code":          {code},
+		"client_id":     {s.cfg.GoogleClientID},
+		"client_secret": {s.cfg.GoogleClientSecret},
+		"redirect_uri":  {redirectURI},
+		"grant_type":    {"authorization_code"},
+	}
+	resp, err := http.PostForm("https://oauth2.googleapis.com/token", form)
+	if err != nil {
+		writeErr(w, http.StatusBadGateway, err.Error())
+		return
+	}
+	defer resp.Body.Close()
+	var tokResp struct {
+		IDToken     string `json:"id_token"`
+		AccessToken string `json:"access_token"`
+	}
+	_ = json.NewDecoder(resp.Body).Decode(&tokResp)
+	if tokResp.AccessToken == "" {
+		writeErr(w, http.StatusUnauthorized, "failed to exchange google code")
+		return
+	}
+
+	req, _ := http.NewRequest(http.MethodGet, "https://www.googleapis.com/oauth2/v3/userinfo", nil)
+	req.Header.Set("Authorization", "Bearer "+tokResp.AccessToken)
+	uResp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		writeErr(w, http.StatusBadGateway, err.Error())
+		return
+	}
+	defer uResp.Body.Close()
+	var info googleInfo
+	_ = json.NewDecoder(uResp.Body).Decode(&info)
+
+	user, err := s.store.UpsertGoogleUser(uuid.NewString(), info.Sub, info.Email, info.Name, info.Picture)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	jwtTok, err := s.issueJWT(user.ID)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	deepLink := fmt.Sprintf("signer://auth?token=%s&email=%s&name=%s",
+		url.QueryEscape(jwtTok), url.QueryEscape(user.Email), url.QueryEscape(user.Name))
+	http.Redirect(w, r, deepLink, http.StatusFound)
+}
+
+func (s *Server) handleMe(w http.ResponseWriter, r *http.Request) {
+	uid := currentUserID(r)
+	u, err := s.store.GetUserByID(uid)
+	if err != nil {
+		writeErr(w, http.StatusNotFound, "user not found")
+		return
+	}
+	acc, _ := s.store.GetAppleAccount(uid)
+	writeJSON(w, http.StatusOK, map[string]any{
+		"user":          u,
+		"apple_account": acc,
+	})
+}
+
+func (s *Server) handleGetAppleAccount(w http.ResponseWriter, r *http.Request) {
+	acc, err := s.store.GetAppleAccount(currentUserID(r))
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if acc == nil {
+		writeJSON(w, http.StatusOK, map[string]any{"logged_in": false})
+		return
+	}
+	writeJSON(w, http.StatusOK, acc)
+}
+
+func (s *Server) handleAppleLogin(w http.ResponseWriter, r *http.Request) {
+	uid := currentUserID(r)
+	var body struct {
+		AppleID    string `json:"apple_id"`
+		Password   string `json:"password"`
+		DeviceUDID string `json:"device_udid"`
+		DeviceName string `json:"device_name"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeErr(w, http.StatusBadRequest, "invalid json")
+		return
+	}
+	if body.AppleID == "" || body.Password == "" {
+		writeErr(w, http.StatusBadRequest, "apple_id and password required")
+		return
+	}
+
+	settings, _ := s.store.GetSettings(uid)
+	s.apple.SetAnisetteURL(settings.AnisetteURL)
+
+	res, pending, err := s.apple.StartLogin(body.AppleID, body.Password)
+	if err != nil {
+		writeErr(w, http.StatusUnauthorized, err.Error())
+		return
+	}
+
+	acc := store.Account{
+		UserID:     uid,
+		AppleID:    body.AppleID,
+		DSID:       res.DSID,
+		GSToken:    res.GSToken,
+		DeviceUDID: body.DeviceUDID,
+		DeviceName: body.DeviceName,
+		Needs2FA:   res.Needs2FA,
+		LoggedIn:   !res.Needs2FA,
+	}
+
+	if res.Needs2FA {
+		s.pendingMu.Lock()
+		s.pendingAuth[uid] = pending
+		s.pendingMu.Unlock()
+		_ = s.store.SaveAppleAccount(acc)
+		writeJSON(w, http.StatusOK, map[string]any{
+			"needs_2fa": true,
+			"account":   acc,
+		})
+		return
+	}
+
+	s.syncTeamsAndSave(uid, &acc, res.Anisette)
+	writeJSON(w, http.StatusOK, map[string]any{
+		"needs_2fa": false,
+		"account":   acc,
+	})
+}
+
+func (s *Server) handleApple2FA(w http.ResponseWriter, r *http.Request) {
+	uid := currentUserID(r)
+	var body struct {
+		Code string `json:"code"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil || len(body.Code) != 6 {
+		writeErr(w, http.StatusBadRequest, "6-digit code required")
+		return
+	}
+
+	s.pendingMu.Lock()
+	pending := s.pendingAuth[uid]
+	s.pendingMu.Unlock()
+	if pending == nil {
+		writeErr(w, http.StatusBadRequest, "no pending 2FA session")
+		return
+	}
+
+	res, err := s.apple.Submit2FA(pending, body.Code)
+	if err != nil {
+		writeErr(w, http.StatusUnauthorized, err.Error())
+		return
+	}
+
+	s.pendingMu.Lock()
+	delete(s.pendingAuth, uid)
+	s.pendingMu.Unlock()
+
+	acc, _ := s.store.GetAppleAccount(uid)
+	if acc == nil {
+		acc = &store.Account{UserID: uid, AppleID: pending.AppleID}
+	}
+	acc.DSID = res.DSID
+	acc.GSToken = res.GSToken
+	acc.Needs2FA = false
+	acc.LoggedIn = true
+	s.syncTeamsAndSave(uid, acc, res.Anisette)
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"needs_2fa": false,
+		"account":   acc,
+	})
+}
+
+func (s *Server) syncTeamsAndSave(uid string, acc *store.Account, anisette apple.AnisetteHeaders) {
+	if teams, err := s.apple.ListTeams(acc.DSID, acc.GSToken, anisette); err == nil && len(teams) > 0 {
+		acc.TeamID = teams[0].TeamID
+		acc.TeamName = teams[0].Name
+		if strings.Contains(strings.ToLower(teams[0].Type), "individual") {
+			acc.TeamType = "free"
+		} else {
+			acc.TeamType = "paid"
+		}
+	}
+	_ = s.store.SaveAppleAccount(*acc)
+}
+
+func (s *Server) handleListAppIDs(w http.ResponseWriter, r *http.Request) {
+	uid := currentUserID(r)
+	acc, _ := s.store.GetAppleAccount(uid)
+	if acc != nil && acc.LoggedIn && acc.TeamID != "" {
+		if anisette, err := s.apple.FetchAnisette(); err == nil {
+			if ids, err := s.apple.ListAppIDs(acc.TeamID, acc.DSID, acc.GSToken, anisette); err == nil {
+				records := make([]store.AppIDRecord, 0, len(ids))
+				for _, id := range ids {
+					isExt := strings.Count(id.Identifier, ".") >= 3 || strings.Contains(strings.ToLower(id.Name), "ext") || strings.Contains(strings.ToLower(id.Name), "widget")
+					records = append(records, store.AppIDRecord{
+						AppIDID:    id.AppIDID,
+						UserID:     uid,
+						Name:       id.Name,
+						Identifier: id.Identifier,
+						IsExt:      isExt,
+					})
+				}
+				_ = s.store.ReplaceAppIDs(uid, records)
+			}
+		}
+	}
+	list, err := s.store.ListAppIDs(uid)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"app_ids": list})
+}
+
+func (s *Server) handleDeleteAppID(w http.ResponseWriter, r *http.Request) {
+	uid := currentUserID(r)
+	appIDID := r.PathValue("id")
+	acc, _ := s.store.GetAppleAccount(uid)
+	if acc != nil && acc.LoggedIn && acc.TeamID != "" {
+		if anisette, err := s.apple.FetchAnisette(); err == nil {
+			_ = s.apple.DeleteAppID(acc.TeamID, appIDID, acc.DSID, acc.GSToken, anisette)
+		}
+	}
+	if err := s.store.DeleteAppID(uid, appIDID); err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"deleted": appIDID})
+}
+
+func (s *Server) handleListCerts(w http.ResponseWriter, r *http.Request) {
+	certs, err := s.store.ListCertificates(currentUserID(r))
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"certificates": certs})
+}
+
+func (s *Server) handleUploadCert(w http.ResponseWriter, r *http.Request) {
+	uid := currentUserID(r)
+	if err := r.ParseMultipartForm(32 << 20); err != nil {
+		writeErr(w, http.StatusBadRequest, "invalid multipart form")
+		return
+	}
+	p12File, _, err := r.FormFile("p12")
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, "p12 file required")
+		return
+	}
+	defer p12File.Close()
+	provFile, _, err := r.FormFile("mobileprovision")
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, "mobileprovision file required")
+		return
+	}
+	defer provFile.Close()
+
+	certID := uuid.NewString()
+	certDir := filepath.Join(s.cfg.DataDir, "certs", uid, certID)
+	_ = os.MkdirAll(certDir, 0o755)
+	p12Path := filepath.Join(certDir, "cert.p12")
+	provPath := filepath.Join(certDir, "profile.mobileprovision")
+
+	if err := saveUploadedFile(p12File, p12Path); err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if err := saveUploadedFile(provFile, provPath); err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	name := r.FormValue("name")
+	if name == "" {
+		name = "Uploaded Certificate"
+	}
+	cert := store.Certificate{
+		ID:                  certID,
+		UserID:              uid,
+		Name:                name,
+		CertType:            "development",
+		P12Path:             p12Path,
+		Password:            r.FormValue("password"),
+		MobileprovisionPath: provPath,
+		ExpiresAt:           time.Now().Add(365 * 24 * time.Hour),
+		Source:              "uploaded",
+		CreatedAt:           time.Now(),
+	}
+	if err := s.store.SaveCertificate(cert); err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, cert)
+}
+
+func (s *Server) handleListApps(w http.ResponseWriter, r *http.Request) {
+	apps, err := s.store.ListApps(currentUserID(r))
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"apps": apps})
+}
+
+func (s *Server) handleUploadIPA(w http.ResponseWriter, r *http.Request) {
+	uid := currentUserID(r)
+	if err := r.ParseMultipartForm(512 << 20); err != nil {
+		writeErr(w, http.StatusBadRequest, "invalid multipart form")
+		return
+	}
+	file, _, err := r.FormFile("ipa")
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, "ipa file required")
+		return
+	}
+	defer file.Close()
+
+	appID := uuid.NewString()
+	appDir := filepath.Join(s.cfg.DataDir, "apps", uid, appID)
+	_ = os.MkdirAll(appDir, 0o755)
+	rawPath := filepath.Join(appDir, "raw.ipa")
+	if err := saveUploadedFile(file, rawPath); err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	s.registerUploadedIPA(w, uid, appID, rawPath)
+}
+
+func (s *Server) handleIPAFromURL(w http.ResponseWriter, r *http.Request) {
+	uid := currentUserID(r)
+	var body struct {
+		URL string `json:"url"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body.URL == "" {
+		writeErr(w, http.StatusBadRequest, "url required")
+		return
+	}
+
+	resp, err := http.Get(body.URL)
+	if err != nil || resp.StatusCode >= 300 {
+		writeErr(w, http.StatusBadGateway, "failed to download ipa")
+		return
+	}
+	defer resp.Body.Close()
+
+	appID := uuid.NewString()
+	appDir := filepath.Join(s.cfg.DataDir, "apps", uid, appID)
+	_ = os.MkdirAll(appDir, 0o755)
+	rawPath := filepath.Join(appDir, "raw.ipa")
+	if err := saveUploadedFile(resp.Body, rawPath); err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	s.registerUploadedIPA(w, uid, appID, rawPath)
+}
+
+func (s *Server) registerUploadedIPA(w http.ResponseWriter, uid, appID, rawPath string) {
+	meta, err := signer.InspectIPA(rawPath)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	app := store.SignedApp{
+		ID:                  appID,
+		UserID:              uid,
+		Name:                meta.Name,
+		BundleID:            meta.BundleID,
+		OriginalBundleID:    meta.BundleID,
+		Version:             meta.Version,
+		RawIPAPath:          rawPath,
+		AvailableExtensions: meta.Extensions,
+		StrippedExtensions:  []string{},
+		SignedAt:            time.Now(),
+		ExpiresAt:           time.Now(),
+		Status:              "unsigned",
+	}
+	if err := s.store.SaveApp(app); err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, app)
+}
+
+func (s *Server) handleSignApp(w http.ResponseWriter, r *http.Request) {
+	uid := currentUserID(r)
+	appID := r.PathValue("id")
+	app, err := s.store.GetApp(appID)
+	if err != nil || app == nil || app.UserID != uid {
+		writeErr(w, http.StatusNotFound, "app not found")
+		return
+	}
+
+	var body struct {
+		CertID          string   `json:"cert_id"`
+		BundleID        string   `json:"bundle_id"`
+		StripExtensions []string `json:"strip_extensions"`
+	}
+	_ = json.NewDecoder(r.Body).Decode(&body)
+
+	cert, err := s.store.GetCertificate(uid, body.CertID)
+	if err != nil || cert == nil {
+		writeErr(w, http.StatusBadRequest, "no signing certificate available; upload .p12 + .mobileprovision or link Apple ID")
+		return
+	}
+
+	outPath := filepath.Join(filepath.Dir(app.RawIPAPath), "signed.ipa")
+	targetBundleID := body.BundleID
+	if targetBundleID == "" {
+		targetBundleID = app.BundleID
+	}
+
+	err = signer.SignIPA(signer.SignOptions{
+		ZsignBin:        s.cfg.ZsignBin,
+		InputIPA:        app.RawIPAPath,
+		OutputIPA:       outPath,
+		P12Path:         cert.P12Path,
+		P12Password:     cert.Password,
+		Mobileprovision: cert.MobileprovisionPath,
+		BundleID:        targetBundleID,
+		StripExts:       body.StripExtensions,
+	})
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	now := time.Now()
+	app.BundleID = targetBundleID
+	app.CertID = cert.ID
+	app.SignedIPAPath = outPath
+	app.StrippedExtensions = body.StripExtensions
+	app.SignedAt = now
+	app.ExpiresAt = now.Add(7 * 24 * time.Hour)
+	app.Status = "signed"
+
+	if err := s.store.SaveApp(*app); err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	baseURL := strings.TrimRight(s.effectivePublicURL(r), "/")
+	manifestURL := fmt.Sprintf("%s/ota/%s/manifest.plist", baseURL, app.ID)
+	otaURL := "itms-services://?action=download-manifest&url=" + url.QueryEscape(manifestURL)
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"app":          app,
+		"ota_url":      otaURL,
+		"manifest_url": manifestURL,
+	})
+}
+
+func (s *Server) handleRenewApp(w http.ResponseWriter, r *http.Request) {
+	uid := currentUserID(r)
+	appID := r.PathValue("id")
+	app, err := s.store.GetApp(appID)
+	if err != nil || app == nil || app.UserID != uid {
+		writeErr(w, http.StatusNotFound, "app not found")
+		return
+	}
+	cert, err := s.store.GetCertificate(uid, app.CertID)
+	if err != nil || cert == nil {
+		writeErr(w, http.StatusBadRequest, "signing certificate not found")
+		return
+	}
+
+	outPath := filepath.Join(filepath.Dir(app.RawIPAPath), "signed.ipa")
+	if err := signer.SignIPA(signer.SignOptions{
+		ZsignBin:        s.cfg.ZsignBin,
+		InputIPA:        app.RawIPAPath,
+		OutputIPA:       outPath,
+		P12Path:         cert.P12Path,
+		P12Password:     cert.Password,
+		Mobileprovision: cert.MobileprovisionPath,
+		BundleID:        app.BundleID,
+		StripExts:       app.StrippedExtensions,
+	}); err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	now := time.Now()
+	app.SignedAt = now
+	app.ExpiresAt = now.Add(7 * 24 * time.Hour)
+	app.Status = "signed"
+	_ = s.store.SaveApp(*app)
+
+	baseURL := strings.TrimRight(s.effectivePublicURL(r), "/")
+	manifestURL := fmt.Sprintf("%s/ota/%s/manifest.plist", baseURL, app.ID)
+	otaURL := "itms-services://?action=download-manifest&url=" + url.QueryEscape(manifestURL)
+	writeJSON(w, http.StatusOK, map[string]any{
+		"app":     app,
+		"ota_url": otaURL,
+	})
+}
+
+func (s *Server) handleDeleteApp(w http.ResponseWriter, r *http.Request) {
+	uid := currentUserID(r)
+	appID := r.PathValue("id")
+	app, _ := s.store.GetApp(appID)
+	if app != nil && app.UserID == uid {
+		_ = os.RemoveAll(filepath.Dir(app.RawIPAPath))
+	}
+	if err := s.store.DeleteApp(uid, appID); err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"deleted": appID})
+}
+
+func (s *Server) handleOTAManifest(w http.ResponseWriter, r *http.Request) {
+	appID := r.PathValue("id")
+	app, err := s.store.GetApp(appID)
+	if err != nil || app == nil || app.SignedIPAPath == "" {
+		writeErr(w, http.StatusNotFound, "signed app not found")
+		return
+	}
+	baseURL := strings.TrimRight(s.effectivePublicURL(r), "/")
+	ipaURL := fmt.Sprintf("%s/ota/%s/app.ipa", baseURL, app.ID)
+	plistBytes := signer.BuildOTAManifest(ipaURL, app.BundleID, app.Version, app.Name)
+	w.Header().Set("Content-Type", "application/xml")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(plistBytes)
+}
+
+func (s *Server) handleOTAIPA(w http.ResponseWriter, r *http.Request) {
+	appID := r.PathValue("id")
+	app, err := s.store.GetApp(appID)
+	if err != nil || app == nil || app.SignedIPAPath == "" {
+		writeErr(w, http.StatusNotFound, "signed ipa not found")
+		return
+	}
+	w.Header().Set("Content-Type", "application/octet-stream")
+	w.Header().Set("Content-Disposition", fmt.Sprintf(`attachment; filename="%s.ipa"`, app.Name))
+	http.ServeFile(w, r, app.SignedIPAPath)
+}
+
+func (s *Server) handleListNotifications(w http.ResponseWriter, r *http.Request) {
+	list, err := s.store.ListNotifications(currentUserID(r))
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"notifications": list})
+}
+
+func (s *Server) handleMarkNotificationsRead(w http.ResponseWriter, r *http.Request) {
+	if err := s.store.MarkNotificationsRead(currentUserID(r)); err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
+func (s *Server) handleTestNotification(w http.ResponseWriter, r *http.Request) {
+	uid := currentUserID(r)
+	settings, _ := s.store.GetSettings(uid)
+	ev := store.NotificationEvent{
+		ID:        uuid.NewString(),
+		UserID:    uid,
+		AppName:   "Signer",
+		Title:     "Test Renewal Alert",
+		Body:      "Push & expiration alerts are working. Tap to renew apps.",
+		Level:     "warning",
+		CreatedAt: time.Now(),
+	}
+	_ = s.store.AddNotification(ev)
+	s.notifier.DispatchPush(settings, ev.Title, ev.Body, ev.Level)
+	writeJSON(w, http.StatusOK, ev)
+}
+
+func (s *Server) handleGetSettings(w http.ResponseWriter, r *http.Request) {
+	st, err := s.store.GetSettings(currentUserID(r))
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, st)
+}
+
+func (s *Server) handleUpdateSettings(w http.ResponseWriter, r *http.Request) {
+	uid := currentUserID(r)
+	var st store.PushSettings
+	if err := json.NewDecoder(r.Body).Decode(&st); err != nil {
+		writeErr(w, http.StatusBadRequest, "invalid json")
+		return
+	}
+	st.UserID = uid
+	if err := s.store.SaveSettings(st); err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, st)
+}
+
+func (s *Server) effectivePublicURL(r *http.Request) string {
+	if s.cfg.PublicURL != "" {
+		return s.cfg.PublicURL
+	}
+	scheme := "https"
+	if r.TLS == nil && r.Header.Get("X-Forwarded-Proto") == "" {
+		scheme = "http"
+	}
+	return scheme + "://" + r.Host
+}
+
+func saveUploadedFile(src io.Reader, dst string) error {
+	out, err := os.Create(dst)
+	if err != nil {
+		return err
+	}
+	defer out.Close()
+	_, err = io.Copy(out, src)
+	return err
+}
+
+func writeJSON(w http.ResponseWriter, code int, v any) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(code)
+	_ = json.NewEncoder(w).Encode(v)
+}
+
+func writeErr(w http.ResponseWriter, code int, msg string) {
+	writeJSON(w, code, map[string]string{"error": msg})
+}
+
+func corsMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Access-Control-Allow-Headers", "Authorization, Content-Type")
+		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
+		if r.Method == http.MethodOptions {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}

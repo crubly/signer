@@ -1,0 +1,6 @@
+.DS_Store
+backend/.env
+backend/data/
+backend/pgdata/
+frontend/Signer.xcodeproj/
+frontend/build/
