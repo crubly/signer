@@ -283,13 +283,14 @@ private struct SignAppSheet: View {
                         .autocorrectionDisabled()
                 }
 
-                Section("Certificate") {
+                Section("Signing Method") {
                     if api.certificates.isEmpty {
-                        Text("No certificates uploaded. Add .p12 + .mobileprovision in Certs tab.")
+                        Label("Auto-provision using Apple ID (\(api.appleAccount?.appleID ?? "connected"))", systemImage: "apple.logo")
                             .font(.caption)
-                            .foregroundStyle(.red)
+                            .foregroundStyle(.secondary)
                     } else {
                         Picker("Signing Cert", selection: $selectedCertID) {
+                            Text("Auto (Apple ID)").tag("")
                             ForEach(api.certificates) { cert in
                                 Text(cert.name).tag(cert.id)
                             }
@@ -344,7 +345,7 @@ private struct SignAppSheet: View {
                             Spacer()
                         }
                     }
-                    .disabled(isSigning || api.certificates.isEmpty)
+                    .disabled(isSigning)
                 }
             }
             .navigationTitle("Sign \(app.name)")

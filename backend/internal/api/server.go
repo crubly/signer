@@ -1,14 +1,17 @@
 package api
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"encoding/pem"
 	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"net/url"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -533,17 +536,28 @@ func (s *Server) handleSignApp(w http.ResponseWriter, r *http.Request) {
 	}
 	_ = json.NewDecoder(r.Body).Decode(&body)
 
-	cert, err := s.store.GetCertificate(uid, body.CertID)
-	if err != nil || cert == nil {
-		writeErr(w, http.StatusBadRequest, "no signing certificate available; upload .p12 + .mobileprovision or link Apple ID")
-		return
-	}
-
-	outPath := filepath.Join(filepath.Dir(app.RawIPAPath), "signed.ipa")
 	targetBundleID := body.BundleID
 	if targetBundleID == "" {
 		targetBundleID = app.BundleID
 	}
+
+	cert, err := s.store.GetCertificate(uid, body.CertID)
+	if err != nil || cert == nil || body.CertID == "" {
+		autoCert, autoBundleID, provErr := s.ensureAppleProvisioning(uid, targetBundleID, app.Name)
+		if provErr == nil && autoCert != nil {
+			cert = autoCert
+			targetBundleID = autoBundleID
+		} else if cert == nil {
+			msg := "no signing certificate available"
+			if provErr != nil {
+				msg = "Apple ID auto-provisioning failed: " + provErr.Error()
+			}
+			writeErr(w, http.StatusBadRequest, msg)
+			return
+		}
+	}
+
+	outPath := filepath.Join(filepath.Dir(app.RawIPAPath), "signed.ipa")
 
 	err = signer.SignIPA(signer.SignOptions{
 		ZsignBin:        s.cfg.ZsignBin,
@@ -627,6 +641,136 @@ func (s *Server) handleRenewApp(w http.ResponseWriter, r *http.Request) {
 		"app":     app,
 		"ota_url": otaURL,
 	})
+}
+
+func (s *Server) ensureAppleProvisioning(uid, bundleID, appName string) (*store.Certificate, string, error) {
+	acc, err := s.store.GetAppleAccount(uid)
+	if err != nil || acc == nil || !acc.LoggedIn || acc.TeamID == "" {
+		return nil, bundleID, errors.New("Apple ID session or Team ID missing; sign in with Apple ID")
+	}
+
+	anisette, err := s.apple.FetchAnisette()
+	if err != nil {
+		return nil, bundleID, err
+	}
+
+	_ = s.apple.AddDevice(acc.TeamID, acc.DeviceName, acc.DeviceUDID, acc.DSID, acc.GSToken, anisette)
+
+	// Generate RSA key + CSR and submit to Apple
+	privPEM, csrPEM, err := apple.GenerateCSR("Signed")
+	if err != nil {
+		return nil, bundleID, err
+	}
+
+	certIDFromApple, err := s.apple.SubmitDevelopmentCSR(acc.TeamID, csrPEM, acc.DSID, acc.GSToken, anisette)
+	if err != nil {
+		// If max certificates reached, revoke oldest dev cert and retry
+		if certs, lerr := s.apple.ListDevCerts(acc.TeamID, acc.DSID, acc.GSToken, anisette); lerr == nil && len(certs) > 0 {
+			_ = s.apple.RevokeDevCert(acc.TeamID, certs[0].SerialNumber, acc.DSID, acc.GSToken, anisette)
+			certIDFromApple, err = s.apple.SubmitDevelopmentCSR(acc.TeamID, csrPEM, acc.DSID, acc.GSToken, anisette)
+		}
+		if err != nil {
+			return nil, bundleID, err
+		}
+	}
+
+	devCerts, err := s.apple.ListDevCerts(acc.TeamID, acc.DSID, acc.GSToken, anisette)
+	if err != nil || len(devCerts) == 0 {
+		return nil, bundleID, errors.New("failed to fetch development certificate from Apple")
+	}
+	var chosen *apple.DevCert
+	for i := range devCerts {
+		if devCerts[i].CertID == certIDFromApple || len(devCerts[i].CertContent) > 0 {
+			chosen = &devCerts[i]
+			if devCerts[i].CertID == certIDFromApple {
+				break
+			}
+		}
+	}
+	if chosen == nil || len(chosen.CertContent) == 0 {
+		return nil, bundleID, errors.New("Apple returned empty certificate content")
+	}
+
+	// Ensure unique App ID for free account (append team suffix if not already)
+	uniqueBundleID := bundleID
+	if !strings.HasSuffix(uniqueBundleID, "."+acc.TeamID) {
+		uniqueBundleID = bundleID + "." + acc.TeamID
+	}
+
+	var targetAppID apple.AppID
+	existingIDs, _ := s.apple.ListAppIDs(acc.TeamID, acc.DSID, acc.GSToken, anisette)
+	for _, id := range existingIDs {
+		if id.Identifier == uniqueBundleID || id.Identifier == bundleID {
+			targetAppID = id
+			uniqueBundleID = id.Identifier
+			break
+		}
+	}
+	if targetAppID.AppIDID == "" {
+		cleanName := strings.Map(func(r rune) rune {
+			if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == ' ' {
+				return r
+			}
+			return ' '
+		}, appName)
+		if strings.TrimSpace(cleanName) == "" {
+			cleanName = "SignedApp"
+		}
+		targetAppID, err = s.apple.AddAppID(acc.TeamID, strings.TrimSpace(cleanName), uniqueBundleID, acc.DSID, acc.GSToken, anisette)
+		if err != nil {
+			return nil, bundleID, err
+		}
+	}
+
+	provBytes, err := s.apple.DownloadProvisioningProfile(acc.TeamID, targetAppID.AppIDID, acc.DSID, acc.GSToken, anisette)
+	if err != nil {
+		return nil, bundleID, err
+	}
+
+	certUUID := uuid.NewString()
+	certDir := filepath.Join(s.cfg.DataDir, "certs", uid, certUUID)
+	_ = os.MkdirAll(certDir, 0o755)
+	keyPath := filepath.Join(certDir, "key.pem")
+	certPEMPath := filepath.Join(certDir, "cert.pem")
+	p12Path := filepath.Join(certDir, "cert.p12")
+	provPath := filepath.Join(certDir, "profile.mobileprovision")
+
+	certPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: chosen.CertContent})
+	if err := os.WriteFile(keyPath, privPEM, 0o600); err != nil {
+		return nil, bundleID, err
+	}
+	if err := os.WriteFile(certPEMPath, certPEM, 0o644); err != nil {
+		return nil, bundleID, err
+	}
+	if err := os.WriteFile(provPath, provBytes, 0o644); err != nil {
+		return nil, bundleID, err
+	}
+
+	var outBuf bytes.Buffer
+	cmd := exec.Command("openssl", "pkcs12", "-export", "-inkey", keyPath, "-in", certPEMPath, "-out", p12Path, "-passout", "pass:")
+	cmd.Stdout = &outBuf
+	cmd.Stderr = &outBuf
+	if err := cmd.Run(); err != nil {
+		return nil, bundleID, fmt.Errorf("openssl pkcs12 failed (%w): %s", err, outBuf.String())
+	}
+
+	cert := store.Certificate{
+		ID:                  certUUID,
+		UserID:              uid,
+		Name:                "Apple Free (" + acc.AppleID + ")",
+		SerialNumber:        chosen.SerialNumber,
+		CertType:            "development",
+		P12Path:             p12Path,
+		Password:            "",
+		MobileprovisionPath: provPath,
+		ExpiresAt:           time.Now().Add(7 * 24 * time.Hour),
+		Source:              "apple",
+		CreatedAt:           time.Now(),
+	}
+	if err := s.store.SaveCertificate(cert); err != nil {
+		return nil, bundleID, err
+	}
+	return &cert, uniqueBundleID, nil
 }
 
 func (s *Server) handleDeactivateApp(w http.ResponseWriter, r *http.Request) {

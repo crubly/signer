@@ -515,6 +515,84 @@ func (c *Client) RevokeDevCert(teamID, serial, dsid, gsToken string, anisette An
 	return err
 }
 
+// AddDevice registers an iOS device UDID under the Apple Developer team (ignores already-registered errors).
+func (c *Client) AddDevice(teamID, deviceName, udid, dsid, gsToken string, anisette AnisetteHeaders) error {
+	if udid == "" {
+		return nil
+	}
+	if deviceName == "" {
+		deviceName = "iPhone"
+	}
+	_, err := c.postDevService("ios/addDevice.action", map[string]any{
+		"teamId":       teamID,
+		"deviceNumber": udid,
+		"deviceName":   deviceName,
+	}, dsid, gsToken, anisette)
+	if err != nil && (strings.Contains(err.Error(), "already exists") || strings.Contains(err.Error(), "35")) {
+		return nil
+	}
+	return err
+}
+
+// SubmitDevelopmentCSR submits a CSR to Apple and returns the certificate request/cert ID.
+func (c *Client) SubmitDevelopmentCSR(teamID string, csrPEM []byte, dsid, gsToken string, anisette AnisetteHeaders) (string, error) {
+	resp, err := c.postDevService("ios/submitDevelopmentCSR.action", map[string]any{
+		"teamId":         teamID,
+		"csrContent":     string(csrPEM),
+		"machineId":      anisette.DeviceID,
+		"machineName":    "SignedServer",
+	}, dsid, gsToken, anisette)
+	if err != nil {
+		return "", err
+	}
+	if reqMap, ok := resp["certRequest"].(map[string]any); ok {
+		if id, ok := reqMap["certificateId"].(string); ok && id != "" {
+			return id, nil
+		}
+		if id, ok := reqMap["certRequestId"].(string); ok && id != "" {
+			return id, nil
+		}
+	}
+	return "", nil
+}
+
+// AddAppID registers an App ID on the Apple Developer team.
+func (c *Client) AddAppID(teamID, name, bundleID, dsid, gsToken string, anisette AnisetteHeaders) (AppID, error) {
+	resp, err := c.postDevService("ios/addAppId.action", map[string]any{
+		"teamId":     teamID,
+		"name":       name,
+		"identifier": bundleID,
+	}, dsid, gsToken, anisette)
+	if err != nil {
+		return AppID{}, err
+	}
+	if m, ok := resp["appId"].(map[string]any); ok {
+		return AppID{
+			AppIDID:    fmt.Sprint(m["appIdId"]),
+			Name:       fmt.Sprint(m["name"]),
+			Identifier: fmt.Sprint(m["identifier"]),
+		}, nil
+	}
+	return AppID{}, errors.New("missing appId in Apple response")
+}
+
+// DownloadProvisioningProfile downloads the team provisioning profile for an App ID.
+func (c *Client) DownloadProvisioningProfile(teamID, appIDID, dsid, gsToken string, anisette AnisetteHeaders) ([]byte, error) {
+	resp, err := c.postDevService("ios/downloadTeamProvisioningProfile.action", map[string]any{
+		"teamId":  teamID,
+		"appIdId": appIDID,
+	}, dsid, gsToken, anisette)
+	if err != nil {
+		return nil, err
+	}
+	if prof, ok := resp["provisioningProfile"].(map[string]any); ok {
+		if raw, ok := prof["encodedProfile"].([]byte); ok && len(raw) > 0 {
+			return raw, nil
+		}
+	}
+	return nil, errors.New("missing encodedProfile in Apple response")
+}
+
 // GenerateCSR creates an RSA 2048 private key and a PEM-encoded CSR.
 func GenerateCSR(commonName string) (privateKeyPEM []byte, csrPEM []byte, err error) {
 	key, err := rsa.GenerateKey(rand.Reader, 2048)
