@@ -425,15 +425,42 @@ func (c *Client) Submit2FA(p *PendingAuth, code string) (*AuthResult, error) {
 		return nil, err
 	}
 	defer resp.Body.Close()
+	respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 2048))
 	if resp.StatusCode >= 300 {
-		body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
-		return nil, fmt.Errorf("2FA verification failed (HTTP %d): %s", resp.StatusCode, string(body))
+		return nil, fmt.Errorf("2FA verification failed (HTTP %d): %s", resp.StatusCode, string(respBody))
 	}
+
+	var hdrKeys []string
+	for k := range resp.Header {
+		hdrKeys = append(hdrKeys, k)
+	}
+	log.Printf("Submit2FA HTTP %d headers=%v body=%s", resp.StatusCode, hdrKeys, string(respBody))
+
+	idmsToken := p.IDMSToken
+	for _, h := range []string{"X-Apple-PE-Token", "X-Apple-IDMS-Token", "X-Apple-GS-Token"} {
+		if v := resp.Header.Get(h); v != "" {
+			idmsToken = v
+			break
+		}
+	}
+
 	allCookies := append([]*http.Cookie(nil), p.Cookies...)
 	allCookies = append(allCookies, resp.Cookies()...)
 	cookieMap := map[string]string{}
 	for _, ck := range allCookies {
 		cookieMap[ck.Name] = ck.Value
+	}
+
+	if xcodeTok, err := c.fetchXcodeGSToken(p.DSID, idmsToken, p.SessionKey, p.Anisette); err == nil && xcodeTok != "" {
+		return &AuthResult{
+			Needs2FA: false,
+			DSID:     p.DSID,
+			GSToken:  xcodeTok,
+			Anisette: p.Anisette,
+			Cookies:  cookieMap,
+		}, nil
+	} else {
+		log.Printf("fetchXcodeGSToken after 2FA failed: %v", err)
 	}
 
 	// Re-run SRP with the 2FA-verified cookies & same Anisette to obtain post-2FA GsIdmsToken + Xcode app token
@@ -443,17 +470,10 @@ func (c *Client) Submit2FA(p *PendingAuth, code string) (*AuthResult, error) {
 	}
 	log.Printf("post-2FA SRP retry result: err=%v, needs2FA=%v", err2, res2 != nil && res2.Needs2FA)
 
-	gsToken := p.IDMSToken
-	xcodeTok, err := c.fetchXcodeGSToken(p.DSID, p.IDMSToken, p.SessionKey, p.Anisette)
-	if err != nil {
-		log.Printf("fetchXcodeGSToken after 2FA failed: %v", err)
-	} else if xcodeTok != "" {
-		gsToken = xcodeTok
-	}
 	return &AuthResult{
 		Needs2FA: false,
 		DSID:     p.DSID,
-		GSToken:  gsToken,
+		GSToken:  idmsToken,
 		Anisette: p.Anisette,
 		Cookies:  cookieMap,
 	}, nil
