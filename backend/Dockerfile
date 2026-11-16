@@ -16,7 +16,13 @@ RUN git clone --depth 1 https://github.com/zhlynn/zsign.git /zsign \
 
 FROM debian:bookworm-slim
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    ca-certificates libssl3 zlib1g zip unzip \
+    ca-certificates curl openssl libssl3 zlib1g zip unzip \
+    && curl -fsSL https://www.apple.com/appleca/AppleIncRootCertificate.cer -o /tmp/apple_root.cer \
+    && openssl x509 -inform der -in /tmp/apple_root.cer -out /usr/local/share/ca-certificates/apple-root-ca.crt \
+    && curl -fsSL https://www.apple.com/certificateauthority/AppleRootCA-G3.cer -o /tmp/apple_g3.cer \
+    && openssl x509 -inform der -in /tmp/apple_g3.cer -out /usr/local/share/ca-certificates/apple-root-ca-g3.crt \
+    && rm -f /tmp/apple_root.cer /tmp/apple_g3.cer \
+    && update-ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=zsign-builder /usr/local/bin/zsign /usr/local/bin/zsign
 COPY --from=go-builder /out/signer-server /usr/local/bin/signer-server
