@@ -611,10 +611,21 @@ func (s *Server) handleRenewApp(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusNotFound, "app not found")
 		return
 	}
+	targetBundleID := app.BundleID
 	cert, err := s.store.GetCertificate(uid, app.CertID)
 	if err != nil || cert == nil {
-		writeErr(w, http.StatusBadRequest, "signing certificate not found")
-		return
+		autoCert, autoBundleID, provErr := s.ensureAppleProvisioning(uid, targetBundleID, app.Name)
+		if provErr == nil && autoCert != nil {
+			cert = autoCert
+			targetBundleID = autoBundleID
+		} else {
+			msg := "signing certificate not found"
+			if provErr != nil {
+				msg = "Apple ID auto-provisioning failed: " + provErr.Error()
+			}
+			writeErr(w, http.StatusBadRequest, msg)
+			return
+		}
 	}
 
 	outPath := filepath.Join(filepath.Dir(app.RawIPAPath), "signed.ipa")
@@ -625,7 +636,7 @@ func (s *Server) handleRenewApp(w http.ResponseWriter, r *http.Request) {
 		P12Path:         cert.P12Path,
 		P12Password:     cert.Password,
 		Mobileprovision: cert.MobileprovisionPath,
-		BundleID:        app.BundleID,
+		BundleID:        targetBundleID,
 		StripExts:       app.StrippedExtensions,
 	}); err != nil {
 		writeErr(w, http.StatusInternalServerError, err.Error())
@@ -633,6 +644,9 @@ func (s *Server) handleRenewApp(w http.ResponseWriter, r *http.Request) {
 	}
 
 	now := time.Now()
+	app.BundleID = targetBundleID
+	app.CertID = cert.ID
+	app.SignedIPAPath = outPath
 	app.SignedAt = now
 	app.ExpiresAt = now.Add(7 * 24 * time.Hour)
 	app.Status = "signed"

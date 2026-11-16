@@ -17,6 +17,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"math/big"
 	"net/http"
 	"strings"
@@ -168,6 +169,10 @@ func (c *Client) StartLogin(appleID, password string) (*AuthResult, *PendingAuth
 	if err != nil {
 		return nil, nil, err
 	}
+	return c.startLoginWithAnisette(appleID, password, anisette, nil)
+}
+
+func (c *Client) startLoginWithAnisette(appleID, password string, anisette AnisetteHeaders, extraCookies []*http.Cookie) (*AuthResult, *PendingAuth, error) {
 
 	// Generate SRP ephemeral keypair: a, A = g^a mod N
 	aBytes := make([]byte, 32)
@@ -426,7 +431,13 @@ func (c *Client) Submit2FA(p *PendingAuth, code string) (*AuthResult, error) {
 		cookieMap[ck.Name] = ck.Value
 	}
 	gsToken := p.IDMSToken
-	if xcodeTok, err := c.fetchXcodeGSToken(p.DSID, p.IDMSToken, p.SessionKey, p.Anisette); err == nil && xcodeTok != "" {
+	xcodeTok, err := c.fetchXcodeGSToken(p.DSID, p.IDMSToken, p.SessionKey, p.Anisette)
+	if err != nil {
+		log.Printf("fetchXcodeGSToken after 2FA failed (%v), retrying SRP with trusted session", err)
+		if res2, _, err2 := c.startLoginWithAnisette(p.AppleID, p.Password, p.Anisette, p.Cookies); err2 == nil && !res2.Needs2FA && res2.GSToken != "" {
+			return res2, nil
+		}
+	} else if xcodeTok != "" {
 		gsToken = xcodeTok
 	}
 	return &AuthResult{
@@ -481,6 +492,12 @@ func (c *Client) fetchXcodeGSToken(dsid, idmsToken string, sessionKey []byte, an
 	respDict, ok := respMap["Response"].(map[string]any)
 	if !ok {
 		return "", errors.New("invalid apptokens response")
+	}
+	if status, ok := respDict["Status"].(map[string]any); ok {
+		if ec, _ := toInt(status["ec"]); ec != 0 {
+			em, _ := status["em"].(string)
+			return "", fmt.Errorf("apptokens error (%d): %s", ec, em)
+		}
 	}
 	etEnc, ok := respDict["et"].([]byte)
 	if !ok || len(etEnc) == 0 {
