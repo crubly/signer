@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"net/url"
 	"os"
@@ -308,7 +309,10 @@ func (s *Server) handleApple2FA(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) syncTeamsAndSave(uid string, acc *store.Account, anisette apple.AnisetteHeaders) {
-	if teams, err := s.apple.ListTeams(acc.DSID, acc.GSToken, anisette); err == nil && len(teams) > 0 {
+	teams, err := s.apple.ListTeams(acc.DSID, acc.GSToken, anisette)
+	if err != nil {
+		log.Printf("apple ListTeams error for %s: %v", acc.AppleID, err)
+	} else if len(teams) > 0 {
 		acc.TeamID = teams[0].TeamID
 		acc.TeamName = teams[0].Name
 		if strings.Contains(strings.ToLower(teams[0].Type), "individual") {
@@ -645,13 +649,28 @@ func (s *Server) handleRenewApp(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) ensureAppleProvisioning(uid, bundleID, appName string) (*store.Certificate, string, error) {
 	acc, err := s.store.GetAppleAccount(uid)
-	if err != nil || acc == nil || !acc.LoggedIn || acc.TeamID == "" {
-		return nil, bundleID, errors.New("Apple ID session or Team ID missing; sign in with Apple ID")
+	if err != nil || acc == nil || !acc.LoggedIn {
+		return nil, bundleID, errors.New("Apple ID session missing; sign in with Apple ID")
 	}
 
 	anisette, err := s.apple.FetchAnisette()
 	if err != nil {
 		return nil, bundleID, err
+	}
+
+	if acc.TeamID == "" {
+		teams, terr := s.apple.ListTeams(acc.DSID, acc.GSToken, anisette)
+		if terr != nil || len(teams) == 0 {
+			return nil, bundleID, fmt.Errorf("failed to fetch Apple Developer Team: %v", terr)
+		}
+		acc.TeamID = teams[0].TeamID
+		acc.TeamName = teams[0].Name
+		if strings.Contains(strings.ToLower(teams[0].Type), "individual") {
+			acc.TeamType = "free"
+		} else {
+			acc.TeamType = "paid"
+		}
+		_ = s.store.SaveAppleAccount(*acc)
 	}
 
 	_ = s.apple.AddDevice(acc.TeamID, acc.DeviceName, acc.DeviceUDID, acc.DSID, acc.GSToken, anisette)

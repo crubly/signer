@@ -179,6 +179,14 @@ struct AppsView: View {
             .sheet(item: $appToSign) { app in
                 SignAppSheet(app: app)
             }
+            .alert("Error", isPresented: Binding(
+                get: { api.errorMessage != nil },
+                set: { if !$0 { api.errorMessage = nil } }
+            )) {
+                Button("OK", role: .cancel) { api.errorMessage = nil }
+            } message: {
+                Text(api.errorMessage ?? "")
+            }
             .overlay {
                 if isBusy {
                     ProgressView("Working on server...")
@@ -313,6 +321,14 @@ private struct SignAppSheet: View {
                             stripExts = Set(app.availableExtensions)
                         }
                         .foregroundStyle(.red)
+                    }
+                }
+
+                if let err = api.errorMessage {
+                    Section {
+                        Text(err)
+                            .font(.caption)
+                            .foregroundStyle(.red)
                     }
                 }
 

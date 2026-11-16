@@ -65,15 +65,16 @@ type AnisetteHeaders struct {
 }
 
 type PendingAuth struct {
-	AppleID   string
-	Password  string
-	Anisette  AnisetteHeaders
-	SessionID string
-	DSID      string
-	IDMSToken string
-	Cookies   []*http.Cookie
-	A         *big.Int
-	aPriv     *big.Int
+	AppleID    string
+	Password   string
+	Anisette   AnisetteHeaders
+	SessionID  string
+	DSID       string
+	IDMSToken  string
+	SessionKey []byte
+	Cookies    []*http.Cookie
+	A          *big.Int
+	aPriv      *big.Int
 }
 
 type AuthResult struct {
@@ -333,14 +334,15 @@ func (c *Client) StartLogin(appleID, password string) (*AuthResult, *PendingAuth
 				}
 			}
 			pending := &PendingAuth{
-				AppleID:   appleID,
-				Password:  password,
-				Anisette:  anisette,
-				DSID:      dsid,
-				IDMSToken: idms,
-				Cookies:   cookies,
-				A:         A,
-				aPriv:     aPriv,
+				AppleID:    appleID,
+				Password:   password,
+				Anisette:   anisette,
+				DSID:       dsid,
+				IDMSToken:  idms,
+				SessionKey: append([]byte(nil), K[:]...),
+				Cookies:    cookies,
+				A:          A,
+				aPriv:      aPriv,
 			}
 			// Trigger trusted device 2FA prompt
 			_ = c.requestTrustedDevice2FA(pending)
@@ -364,6 +366,10 @@ func (c *Client) StartLogin(appleID, password string) (*AuthResult, *PendingAuth
 	cookieMap := map[string]string{}
 	for _, ck := range cookies {
 		cookieMap[ck.Name] = ck.Value
+	}
+
+	if xcodeTok, err := c.fetchXcodeGSToken(dsid, gsToken, K[:], anisette); err == nil && xcodeTok != "" {
+		gsToken = xcodeTok
 	}
 
 	return &AuthResult{
@@ -419,13 +425,79 @@ func (c *Client) Submit2FA(p *PendingAuth, code string) (*AuthResult, error) {
 	for _, ck := range resp.Cookies() {
 		cookieMap[ck.Name] = ck.Value
 	}
+	gsToken := p.IDMSToken
+	if xcodeTok, err := c.fetchXcodeGSToken(p.DSID, p.IDMSToken, p.SessionKey, p.Anisette); err == nil && xcodeTok != "" {
+		gsToken = xcodeTok
+	}
 	return &AuthResult{
 		Needs2FA: false,
 		DSID:     p.DSID,
-		GSToken:  p.IDMSToken,
+		GSToken:  gsToken,
 		Anisette: p.Anisette,
 		Cookies:  cookieMap,
 	}, nil
+}
+
+func (c *Client) fetchXcodeGSToken(dsid, idmsToken string, sessionKey []byte, anisette AnisetteHeaders) (string, error) {
+	if dsid == "" || idmsToken == "" || len(sessionKey) == 0 {
+		return "", errors.New("missing session data for apptokens")
+	}
+	mac := hmac.New(sha256.New, sessionKey)
+	mac.Write([]byte("apptokens"))
+	mac.Write([]byte(dsid))
+	mac.Write([]byte(xcodeAppBundleID))
+	checksum := mac.Sum(nil)
+
+	payload := map[string]any{
+		"Header": map[string]any{
+			"Version": "1.0.1",
+		},
+		"Request": map[string]any{
+			"CPD": map[string]any{
+				"bootstrap":             true,
+				"icscrec":               true,
+				"pbe":                   false,
+				"prkgen":                true,
+				"svct":                  "iCloud",
+				"X-Apple-I-Client-Time": anisette.ClientTime,
+				"X-Apple-I-MD":          anisette.MachineID,
+				"X-Apple-I-MD-M":        anisette.OneTimePassword,
+				"X-Apple-I-MD-RINFO":    anisette.RoutingInfo,
+				"X-Apple-I-MD-LU":       anisette.LocalUserID,
+				"X-Mme-Device-Id":       anisette.DeviceID,
+			},
+			"app":      []string{xcodeAppBundleID},
+			"checksum": checksum,
+			"o":        "apptokens",
+			"t":        idmsToken,
+			"u":        dsid,
+		},
+	}
+
+	respMap, _, err := c.postGSAPlist(payload, anisette)
+	if err != nil {
+		return "", err
+	}
+	respDict, ok := respMap["Response"].(map[string]any)
+	if !ok {
+		return "", errors.New("invalid apptokens response")
+	}
+	etEnc, ok := respDict["et"].([]byte)
+	if !ok || len(etEnc) == 0 {
+		return "", errors.New("missing encrypted token in apptokens response")
+	}
+	etMap, err := decryptSPD(sessionKey, etEnc)
+	if err != nil {
+		return "", err
+	}
+	if tMap, ok := etMap["t"].(map[string]any); ok {
+		if appMap, ok := tMap[xcodeAppBundleID].(map[string]any); ok {
+			if tok, ok := appMap["token"].(string); ok && tok != "" {
+				return tok, nil
+			}
+		}
+	}
+	return "", errors.New("xcode token not found in apptokens")
 }
 
 // ListTeams fetches Apple Developer teams for the authenticated account.
