@@ -2,7 +2,7 @@ name: Signer
 options:
   bundleIdPrefix: com.crubly
   deploymentTarget:
-    iOS: "16.0"
+    iOS: "17.0"
   xcodeVersion: "15.0"
 
 targets:
