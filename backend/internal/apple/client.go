@@ -20,6 +20,8 @@ import (
 	"log"
 	"math/big"
 	"net/http"
+	"net/url"
+	"strconv"
 	"strings"
 	"time"
 
@@ -29,12 +31,16 @@ import (
 )
 
 const (
-	gsaURL              = "https://gsa.apple.com/grandslam/GsService2"
-	devServicesBaseURL  = "https://developerservices2.apple.com/services/QH65B2"
-	xcodeClientID       = "X2464616693961918"
-	xcodeUserAgent      = "Xcode"
-	xcodeAppBundleID    = "com.apple.gs.xcode.auth"
-	defaultAnisetteURL  = "https://ani.sidestore.io"
+	gsaURL             = "https://gsa.apple.com/grandslam/GsService2"
+	gsaValidateURL     = "https://gsa.apple.com/grandslam/GsService2/validate"
+	gsaTrustedDevURL   = "https://gsa.apple.com/auth/verify/trusteddevice"
+	devServicesBaseURL = "https://developerservices2.apple.com/services/QH65B2"
+	servicesV1BaseURL  = "https://developerservices2.apple.com/services/v1"
+	xcodeClientID      = "XABBG36SBA"
+	xcodeVersion       = "11.2 (11B41)"
+	xcodeUserAgent     = "Xcode"
+	xcodeAppBundleID   = "com.apple.gs.xcode.auth"
+	defaultAnisetteURL = "https://ani.sidestore.io"
 )
 
 // SRP-6a 2048-bit prime (RFC 5054) and generator g=2
@@ -55,42 +61,39 @@ var (
 )
 
 type AnisetteHeaders struct {
-	MachineID       string `json:"X-Apple-I-MD"`
-	OneTimePassword string `json:"X-Apple-I-MD-M"`
+	OneTimePassword string `json:"X-Apple-I-MD"`
+	MachineID       string `json:"X-Apple-I-MD-M"`
 	RoutingInfo     string `json:"X-Apple-I-MD-RINFO"`
 	LocalUserID     string `json:"X-Apple-I-MD-LU"`
 	DeviceID        string `json:"X-Mme-Device-Id"`
-	ClientInfo      string `json:"X-Mme-Client-Info"`
+	ClientInfo      string `json:"X-MMe-Client-Info"`
 	Serial          string `json:"X-Apple-I-SRL-NO"`
 	ClientTime      string `json:"X-Apple-I-Client-Time"`
+	Locale          string `json:"X-Apple-Locale"`
+	TimeZone        string `json:"X-Apple-I-TimeZone"`
 }
 
 type PendingAuth struct {
-	AppleID    string
-	Password   string
-	Anisette   AnisetteHeaders
-	SessionID  string
-	DSID       string
-	IDMSToken  string
-	SessionKey []byte
-	Cookies    []*http.Cookie
-	A          *big.Int
-	aPriv      *big.Int
+	AppleID   string
+	Password  string
+	Anisette  AnisetteHeaders
+	SessionID string
+	DSID      string
+	IDMSToken string
 }
 
 type AuthResult struct {
-	Needs2FA  bool
-	DSID      string
-	GSToken   string
-	Anisette  AnisetteHeaders
-	Cookies   map[string]string
+	Needs2FA bool
+	DSID     string
+	GSToken  string
+	Anisette AnisetteHeaders
 }
 
 type Team struct {
-	TeamID   string `plist:"teamId" json:"team_id"`
-	Name     string `plist:"name" json:"name"`
-	Type     string `plist:"type" json:"type"`
-	Status   string `plist:"status" json:"status"`
+	TeamID string `plist:"teamId" json:"team_id"`
+	Name   string `plist:"name" json:"name"`
+	Type   string `plist:"type" json:"type"`
+	Status string `plist:"status" json:"status"`
 }
 
 type AppID struct {
@@ -100,12 +103,11 @@ type AppID struct {
 }
 
 type DevCert struct {
-	CertID       string `plist:"certificateId" json:"certificate_id"`
-	Name         string `plist:"name" json:"name"`
-	SerialNumber string `plist:"serialNumber" json:"serial_number"`
-	CertContent  []byte `plist:"certContent" json:"-"`
-	Status       string `plist:"statusString" json:"status"`
-	ExpiresDate  string `plist:"expirationDate" json:"expiration_date"`
+	CertID       string `json:"certificate_id"`
+	Name         string `json:"name"`
+	SerialNumber string `json:"serial_number"`
+	MachineName  string `json:"machine_name"`
+	CertContent  []byte `json:"-"`
 }
 
 type Client struct {
@@ -138,7 +140,7 @@ func (c *Client) FetchAnisette() (AnisetteHeaders, error) {
 	if err != nil {
 		return h, err
 	}
-	req.Header.Set("User-Agent", "Signer/1.0")
+	req.Header.Set("User-Agent", "Signed/1.0")
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
 		return h, fmt.Errorf("anisette fetch failed: %w", err)
@@ -151,28 +153,68 @@ func (c *Client) FetchAnisette() (AnisetteHeaders, error) {
 	if err := json.NewDecoder(resp.Body).Decode(&h); err != nil {
 		return h, fmt.Errorf("anisette decode error: %w", err)
 	}
-	if h.ClientTime == "" {
-		h.ClientTime = time.Now().UTC().Format("2006-01-02T15:04:05Z")
-	}
+	normalizeAnisette(&h)
+	return h, nil
+}
+
+func normalizeAnisette(h *AnisetteHeaders) {
+	h.ClientTime = time.Now().UTC().Format("2006-01-02T15:04:05Z")
 	if h.ClientInfo == "" {
-		h.ClientInfo = "<MacBookPro18,1> <macOS;14.5;23F79> <com.apple.AuthKit/1 (com.apple.dt.Xcode/3594.4.19)>"
+		h.ClientInfo = "<MacBookPro13,2> <macOS;13.1;22C65> <com.apple.AuthKit/1 (com.apple.akd/1.0)>"
 	}
 	if h.DeviceID == "" {
 		h.DeviceID = strings.ToUpper(uuid.NewString())
 	}
-	return h, nil
+	if h.RoutingInfo == "" {
+		h.RoutingInfo = "17106176"
+	}
+	if h.Serial == "" {
+		h.Serial = "0"
+	}
+	if h.Locale == "" {
+		h.Locale = "en_US"
+	}
+	if h.TimeZone == "" {
+		h.TimeZone = "UTC"
+	}
 }
 
-// StartLogin initiates Apple GrandSlam SRP-6a authentication.
+func buildCPDDict(a AnisetteHeaders) map[string]any {
+	rinfoInt, err := strconv.Atoi(a.RoutingInfo)
+	if err != nil {
+		rinfoInt = 17106176
+	}
+	return map[string]any{
+		"bootstrap":             true,
+		"icscrec":               true,
+		"loc":                   a.Locale,
+		"pbe":                   false,
+		"prkgen":                true,
+		"svct":                  "iCloud",
+		"X-Apple-I-Client-Time": a.ClientTime,
+		"X-Apple-Locale":        a.Locale,
+		"X-Apple-I-TimeZone":    a.TimeZone,
+		"X-Apple-I-MD":          a.OneTimePassword,
+		"X-Apple-I-MD-LU":       a.LocalUserID,
+		"X-Apple-I-MD-M":        a.MachineID,
+		"X-Apple-I-MD-RINFO":    rinfoInt,
+		"X-Mme-Device-Id":       a.DeviceID,
+		"X-Apple-I-SRL-NO":      a.Serial,
+	}
+}
+
+// StartLogin initiates Apple GrandSlam SRP-6a authentication (matching AltSign).
 func (c *Client) StartLogin(appleID, password string) (*AuthResult, *PendingAuth, error) {
 	anisette, err := c.FetchAnisette()
 	if err != nil {
 		return nil, nil, err
 	}
-	return c.startLoginWithAnisette(appleID, password, anisette, nil)
+	return c.startLoginWithAnisette(appleID, password, anisette)
 }
 
-func (c *Client) startLoginWithAnisette(appleID, password string, anisette AnisetteHeaders, extraCookies []*http.Cookie) (*AuthResult, *PendingAuth, error) {
+func (c *Client) startLoginWithAnisette(appleID, password string, anisette AnisetteHeaders) (*AuthResult, *PendingAuth, error) {
+	normalizeAnisette(&anisette)
+	cpdDict := buildCPDDict(anisette)
 
 	// Generate SRP ephemeral keypair: a, A = g^a mod N
 	aBytes := make([]byte, 32)
@@ -183,48 +225,17 @@ func (c *Client) startLoginWithAnisette(appleID, password string, anisette Anise
 	A := new(big.Int).Exp(srpG, aPriv, srpN)
 	aPubBytes := padBigInt(A, 256)
 
-	initPayload := map[string]any{
-		"Header": map[string]any{
-			"Version": "1.0.1",
-		},
-		"Request": map[string]any{
-			"CPD": map[string]any{
-				"bootstrap": true,
-				"icscrec":   true,
-				"pbe":       false,
-				"prkgen":    true,
-				"svct":      "iCloud",
-				"X-Apple-I-Client-Time": anisette.ClientTime,
-				"X-Apple-I-MD":          anisette.MachineID,
-				"X-Apple-I-MD-M":        anisette.OneTimePassword,
-				"X-Apple-I-MD-RINFO":    anisette.RoutingInfo,
-				"X-Apple-I-MD-LU":       anisette.LocalUserID,
-				"X-Mme-Device-Id":       anisette.DeviceID,
-			},
-			"A2k": aPubBytes,
-			"o":   "init",
-			"ps":  []string{"s2k", "s2k_fo"},
-			"u":   appleID,
-		},
+	initReq := map[string]any{
+		"A2k": aPubBytes,
+		"ps":  []string{"s2k", "s2k_fo"},
+		"cpd": cpdDict,
+		"u":   appleID,
+		"o":   "init",
 	}
 
-	respMap, cookies, err := c.postGSAPlistWithCookies(initPayload, anisette, extraCookies)
+	respDict, err := c.sendGSARequest(initReq, anisette)
 	if err != nil {
 		return nil, nil, err
-	}
-	if len(extraCookies) > 0 {
-		cookies = append(extraCookies, cookies...)
-	}
-
-	respDict, ok := respMap["Response"].(map[string]any)
-	if !ok {
-		return nil, nil, errors.New("invalid GSA init response")
-	}
-	if status, ok := respDict["Status"].(map[string]any); ok {
-		if ec, _ := toInt(status["ec"]); ec != 0 {
-			em, _ := status["em"].(string)
-			return nil, nil, fmt.Errorf("Apple ID error (%d): %s", ec, em)
-		}
 	}
 
 	saltBytes, _ := respDict["s"].([]byte)
@@ -236,14 +247,14 @@ func (c *Client) startLoginWithAnisette(appleID, password string, anisette Anise
 		return nil, nil, errors.New("incomplete SRP challenge from Apple")
 	}
 
-	// Compute SRP-6a shared secret & M1
+	// Compute SRP-6a shared secret & M1 (noUsernameInX = true)
 	pwHash := sha256.Sum256([]byte(password))
 	var derived []byte
-	if spStr == "s2k_fo" {
+	if spStr == "s2k" {
+		derived = pbkdf2.Key(pwHash[:], saltBytes, iterCount, 32, sha256.New)
+	} else {
 		hexDigest := fmt.Sprintf("%x", pwHash)
 		derived = pbkdf2.Key([]byte(hexDigest), saltBytes, iterCount, 32, sha256.New)
-	} else {
-		derived = pbkdf2.Key(pwHash[:], saltBytes, iterCount, 32, sha256.New)
 	}
 
 	B := new(big.Int).SetBytes(bBytes)
@@ -261,7 +272,7 @@ func (c *Client) startLoginWithAnisette(appleID, password string, anisette Anise
 	uHash.Write(bPadded)
 	u := new(big.Int).SetBytes(uHash.Sum(nil))
 
-	// x = H(salt | H(":" | derived))  [Apple GSA SRP omits username here]
+	// x = H(salt | H(":" | derived))
 	idHash := sha256.New()
 	idHash.Write([]byte(":"))
 	idHash.Write(derived)
@@ -298,253 +309,192 @@ func (c *Client) startLoginWithAnisette(appleID, password string, anisette Anise
 	m1Hash.Write(K[:])
 	M1 := m1Hash.Sum(nil)
 
-	completePayload := map[string]any{
-		"Header": map[string]any{
-			"Version": "1.0.1",
-		},
-		"Request": map[string]any{
-			"CPD": initPayload["Request"].(map[string]any)["CPD"],
-			"M1":  M1,
-			"c":   cStr,
-			"o":   "complete",
-			"u":   appleID,
-		},
+	compReq := map[string]any{
+		"c":   cStr,
+		"M1":  M1,
+		"cpd": cpdDict,
+		"u":   appleID,
+		"o":   "complete",
 	}
 
-	compMap, compCookies, err := c.postGSAPlistWithCookies(completePayload, anisette, cookies)
+	compResp, err := c.sendGSARequest(compReq, anisette)
 	if err != nil {
 		return nil, nil, err
 	}
-	if len(compCookies) > 0 {
-		cookies = append(cookies, compCookies...)
+
+	spdEnc, ok := compResp["spd"].([]byte)
+	if !ok || len(spdEnc) == 0 {
+		return nil, nil, errors.New("missing spd in GSA complete response")
+	}
+	spdMap, err := decryptSPD(K[:], spdEnc)
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to decrypt spd: %w", err)
 	}
 
-	compResp, ok := compMap["Response"].(map[string]any)
-	if !ok {
-		return nil, nil, errors.New("invalid GSA complete response")
+	adsid, _ := spdMap["adsid"].(string)
+	idmsToken, _ := spdMap["GsIdmsToken"].(string)
+	if adsid == "" || idmsToken == "" {
+		return nil, nil, errors.New("missing adsid or GsIdmsToken in spd")
 	}
+
 	if status, ok := compResp["Status"].(map[string]any); ok {
-		if ec, _ := toInt(status["ec"]); ec != 0 {
-			em, _ := status["em"].(string)
-			return nil, nil, fmt.Errorf("Apple ID auth failed (%d): %s", ec, em)
-		}
 		if au, _ := status["au"].(string); au == "trustedDeviceSecondaryAuth" || au == "secondaryAuth" {
-			dsid, _ := compResp["dsid"].(string)
-			idms := ""
-			if spdEnc, ok := compResp["spd"].([]byte); ok && len(spdEnc) > 0 {
-				if spdMap, err := decryptSPD(K[:], spdEnc); err == nil {
-					if v, ok := spdMap["adsid"].(string); ok && v != "" {
-						dsid = v
-					}
-					if v, ok := spdMap["GsIdmsToken"].(string); ok {
-						idms = v
-					}
-				}
-			}
 			pending := &PendingAuth{
-				AppleID:    appleID,
-				Password:   password,
-				Anisette:   anisette,
-				DSID:       dsid,
-				IDMSToken:  idms,
-				SessionKey: append([]byte(nil), K[:]...),
-				Cookies:    cookies,
-				A:          A,
-				aPriv:      aPriv,
+				AppleID:   appleID,
+				Password:  password,
+				Anisette:  anisette,
+				DSID:      adsid,
+				IDMSToken: idmsToken,
 			}
-			// Trigger trusted device 2FA prompt
-			_ = c.requestTrustedDevice2FA(pending)
-			return &AuthResult{Needs2FA: true, DSID: dsid, Anisette: anisette}, pending, nil
+			if err := c.requestTrustedDevice2FA(pending); err != nil {
+				log.Printf("requestTrustedDevice2FA warning: %v", err)
+			}
+			return &AuthResult{Needs2FA: true, DSID: adsid, Anisette: anisette}, pending, nil
 		}
 	}
 
-	// Extract spd (encrypted with K) if present
-	dsid, _ := compResp["dsid"].(string)
-	gsToken := ""
-	if spdEnc, ok := compResp["spd"].([]byte); ok && len(spdEnc) > 0 {
-		if spdMap, err := decryptSPD(K[:], spdEnc); err == nil {
-			if v, ok := spdMap["adsid"].(string); ok && v != "" {
-				dsid = v
-			}
-			if v, ok := spdMap["GsIdmsToken"].(string); ok {
-				gsToken = v
-			}
-		}
-	}
-	cookieMap := map[string]string{}
-	for _, ck := range cookies {
-		cookieMap[ck.Name] = ck.Value
+	sk, _ := spdMap["sk"].([]byte)
+	cVal := spdMap["c"]
+	if len(sk) == 0 || cVal == nil {
+		return nil, nil, errors.New("missing sk or c in decrypted spd")
 	}
 
-	if xcodeTok, err := c.fetchXcodeGSToken(dsid, gsToken, K[:], anisette); err == nil && xcodeTok != "" {
-		gsToken = xcodeTok
+	xcodeTok, err := c.fetchXcodeAuthToken(adsid, idmsToken, sk, cVal, cpdDict, anisette)
+	if err != nil {
+		return nil, nil, fmt.Errorf("fetchXcodeAuthToken failed: %w", err)
 	}
 
 	return &AuthResult{
 		Needs2FA: false,
-		DSID:     dsid,
-		GSToken:  gsToken,
+		DSID:     adsid,
+		GSToken:  xcodeTok,
 		Anisette: anisette,
-		Cookies:  cookieMap,
 	}, nil, nil
 }
 
+func (c *Client) apply2FAHeaders(req *http.Request, dsid, idmsToken string, a AnisetteHeaders) {
+	encodedIdentity := base64.StdEncoding.EncodeToString([]byte(dsid + ":" + idmsToken))
+	req.Header.Set("Content-Type", "text/x-xml-plist")
+	req.Header.Set("User-Agent", xcodeUserAgent)
+	req.Header.Set("Accept", "text/x-xml-plist")
+	req.Header.Set("Accept-Language", "en-us")
+	req.Header.Set("X-Apple-App-Info", xcodeAppBundleID)
+	req.Header.Set("X-Xcode-Version", xcodeVersion)
+	req.Header.Set("X-Apple-Identity-Token", encodedIdentity)
+	c.applyAnisetteHeaders(req, a)
+}
+
 func (c *Client) requestTrustedDevice2FA(p *PendingAuth) error {
-	req, err := http.NewRequest(http.MethodGet, "https://gsa.apple.com/auth/verify/trusteddevice", nil)
+	req, err := http.NewRequest(http.MethodGet, gsaTrustedDevURL, nil)
 	if err != nil {
 		return err
 	}
-	c.applyAnisetteHeaders(req, p.Anisette)
-	req.Header.Set("X-Apple-Identity-Token", base64.StdEncoding.EncodeToString([]byte(p.DSID+":"+p.IDMSToken)))
+	normalizeAnisette(&p.Anisette)
+	c.apply2FAHeaders(req, p.DSID, p.IDMSToken, p.Anisette)
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
 		return err
 	}
-	resp.Body.Close()
+	defer resp.Body.Close()
+	_, _ = io.Copy(io.Discard, resp.Body)
 	return nil
 }
 
-// Submit2FA submits the 6-digit trusted device verification code.
+// Submit2FA validates the 6-digit code via GsService2/validate (matching AltSign),
+// then restarts SRP authentication using the now-trusted Anisette data to fetch the Xcode GS token.
 func (c *Client) Submit2FA(p *PendingAuth, code string) (*AuthResult, error) {
 	if p == nil {
 		return nil, errors.New("no pending 2FA session")
 	}
-	req, err := http.NewRequest(http.MethodPost, "https://gsa.apple.com/auth/verify/trusteddevice/securitycode", strings.NewReader(fmt.Sprintf(`{"securityCode":{"code":"%s"}}`, code)))
+	req, err := http.NewRequest(http.MethodGet, gsaValidateURL, nil)
 	if err != nil {
 		return nil, err
 	}
-	c.applyAnisetteHeaders(req, p.Anisette)
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Accept", "application/json")
-	req.Header.Set("X-Apple-Identity-Token", base64.StdEncoding.EncodeToString([]byte(p.DSID+":"+p.IDMSToken)))
-	for _, ck := range p.Cookies {
-		req.AddCookie(ck)
-	}
+	normalizeAnisette(&p.Anisette)
+	c.apply2FAHeaders(req, p.DSID, p.IDMSToken, p.Anisette)
+	req.Header.Set("security-code", code)
+
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
 		return nil, err
 	}
 	defer resp.Body.Close()
-	respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 2048))
-	if resp.StatusCode >= 300 {
-		return nil, fmt.Errorf("2FA verification failed (HTTP %d): %s", resp.StatusCode, string(respBody))
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
 	}
 
-	var hdrKeys []string
-	for k := range resp.Header {
-		hdrKeys = append(hdrKeys, k)
+	var valDict map[string]any
+	if _, err := plist.Unmarshal(body, &valDict); err != nil {
+		return nil, fmt.Errorf("2FA validate plist decode error (HTTP %d): %w", resp.StatusCode, err)
 	}
-	log.Printf("Submit2FA HTTP %d headers=%v body=%s", resp.StatusCode, hdrKeys, string(respBody))
-
-	idmsToken := p.IDMSToken
-	for _, h := range []string{"X-Apple-PE-Token", "X-Apple-IDMS-Token", "X-Apple-GS-Token"} {
-		if v := resp.Header.Get(h); v != "" {
-			idmsToken = v
-			break
+	if ec, ok := toInt(valDict["ec"]); ok && ec != 0 {
+		em, _ := valDict["em"].(string)
+		if ec == -21669 {
+			return nil, errors.New("incorrect 2FA verification code")
 		}
+		return nil, fmt.Errorf("2FA validate error (%d): %s", ec, em)
 	}
 
-	allCookies := append([]*http.Cookie(nil), p.Cookies...)
-	allCookies = append(allCookies, resp.Cookies()...)
-	cookieMap := map[string]string{}
-	for _, ck := range allCookies {
-		cookieMap[ck.Name] = ck.Value
+	// Restart authentication with the same Anisette — now 2FA-trusted on GSA!
+	res, _, err := c.startLoginWithAnisette(p.AppleID, p.Password, p.Anisette)
+	if err != nil {
+		return nil, fmt.Errorf("post-2FA login failed: %w", err)
 	}
-
-	if xcodeTok, err := c.fetchXcodeGSToken(p.DSID, idmsToken, p.SessionKey, p.Anisette); err == nil && xcodeTok != "" {
-		return &AuthResult{
-			Needs2FA: false,
-			DSID:     p.DSID,
-			GSToken:  xcodeTok,
-			Anisette: p.Anisette,
-			Cookies:  cookieMap,
-		}, nil
-	} else {
-		log.Printf("fetchXcodeGSToken after 2FA failed: %v", err)
+	if res.Needs2FA {
+		return nil, errors.New("Apple still requested 2FA after code validation")
 	}
-
-	// Re-run SRP with the 2FA-verified cookies & same Anisette to obtain post-2FA GsIdmsToken + Xcode app token
-	res2, _, err2 := c.startLoginWithAnisette(p.AppleID, p.Password, p.Anisette, allCookies)
-	if err2 == nil && !res2.Needs2FA && res2.GSToken != "" {
-		return res2, nil
-	}
-	log.Printf("post-2FA SRP retry result: err=%v, needs2FA=%v", err2, res2 != nil && res2.Needs2FA)
-
-	return &AuthResult{
-		Needs2FA: false,
-		DSID:     p.DSID,
-		GSToken:  idmsToken,
-		Anisette: p.Anisette,
-		Cookies:  cookieMap,
-	}, nil
+	return res, nil
 }
 
-func (c *Client) fetchXcodeGSToken(dsid, idmsToken string, sessionKey []byte, anisette AnisetteHeaders) (string, error) {
-	if dsid == "" || idmsToken == "" || len(sessionKey) == 0 {
-		return "", errors.New("missing session data for apptokens")
-	}
-	mac := hmac.New(sha256.New, sessionKey)
+func (c *Client) fetchXcodeAuthToken(adsid, idmsToken string, sk []byte, cVal any, cpdDict map[string]any, anisette AnisetteHeaders) (string, error) {
+	apps := []string{xcodeAppBundleID}
+	mac := hmac.New(sha256.New, sk)
 	mac.Write([]byte("apptokens"))
-	mac.Write([]byte(dsid))
-	mac.Write([]byte(xcodeAppBundleID))
+	mac.Write([]byte(adsid))
+	for _, app := range apps {
+		mac.Write([]byte(app))
+	}
 	checksum := mac.Sum(nil)
 
-	payload := map[string]any{
-		"Header": map[string]any{
-			"Version": "1.0.1",
-		},
-		"Request": map[string]any{
-			"CPD": map[string]any{
-				"bootstrap":             true,
-				"icscrec":               true,
-				"pbe":                   false,
-				"prkgen":                true,
-				"svct":                  "iCloud",
-				"X-Apple-I-Client-Time": anisette.ClientTime,
-				"X-Apple-I-MD":          anisette.MachineID,
-				"X-Apple-I-MD-M":        anisette.OneTimePassword,
-				"X-Apple-I-MD-RINFO":    anisette.RoutingInfo,
-				"X-Apple-I-MD-LU":       anisette.LocalUserID,
-				"X-Mme-Device-Id":       anisette.DeviceID,
-			},
-			"app":      []string{xcodeAppBundleID},
-			"checksum": checksum,
-			"o":        "apptokens",
-			"t":        idmsToken,
-			"u":        dsid,
-		},
+	reqDict := map[string]any{
+		"u":        adsid,
+		"app":      apps,
+		"c":        cVal,
+		"t":        idmsToken,
+		"checksum": checksum,
+		"cpd":      cpdDict,
+		"o":        "apptokens",
 	}
 
-	respMap, _, err := c.postGSAPlist(payload, anisette)
+	respDict, err := c.sendGSARequest(reqDict, anisette)
 	if err != nil {
 		return "", err
 	}
-	respDict, ok := respMap["Response"].(map[string]any)
-	if !ok {
-		return "", errors.New("invalid apptokens response")
-	}
-	if status, ok := respDict["Status"].(map[string]any); ok {
-		if ec, _ := toInt(status["ec"]); ec != 0 {
-			em, _ := status["em"].(string)
-			return "", fmt.Errorf("apptokens error (%d): %s", ec, em)
-		}
-	}
+
 	etEnc, ok := respDict["et"].([]byte)
 	if !ok || len(etEnc) == 0 {
-		return "", errors.New("missing encrypted token in apptokens response")
+		return "", errors.New("missing encrypted token (et) in apptokens response")
 	}
-	etMap, err := decryptSPD(sessionKey, etEnc)
+
+	decBytes, err := decryptETGCM(sk, etEnc)
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("failed to decrypt apptoken GCM: %w", err)
 	}
-	if tMap, ok := etMap["t"].(map[string]any); ok {
+
+	var tokPlist map[string]any
+	if _, err := plist.Unmarshal(decBytes, &tokPlist); err != nil {
+		return "", fmt.Errorf("failed to parse decrypted apptoken plist: %w", err)
+	}
+
+	if tMap, ok := tokPlist["t"].(map[string]any); ok {
 		if appMap, ok := tMap[xcodeAppBundleID].(map[string]any); ok {
 			if tok, ok := appMap["token"].(string); ok && tok != "" {
 				return tok, nil
 			}
 		}
 	}
-	return "", errors.New("xcode token not found in apptokens")
+	return "", errors.New("token missing in decrypted apptoken plist")
 }
 
 // ListTeams fetches Apple Developer teams for the authenticated account.
@@ -557,13 +507,12 @@ func (c *Client) ListTeams(dsid, gsToken string, anisette AnisetteHeaders) ([]Te
 	var teams []Team
 	for _, item := range rawTeams {
 		if m, ok := item.(map[string]any); ok {
-			t := Team{
+			teams = append(teams, Team{
 				TeamID: fmt.Sprint(m["teamId"]),
 				Name:   fmt.Sprint(m["name"]),
 				Type:   fmt.Sprint(m["type"]),
 				Status: fmt.Sprint(m["status"]),
-			}
-			teams = append(teams, t)
+			})
 		}
 	}
 	return teams, nil
@@ -600,37 +549,59 @@ func (c *Client) DeleteAppID(teamID, appIDID, dsid, gsToken string, anisette Ani
 	return err
 }
 
-// ListDevCerts lists development certificates on the Apple Developer account.
+// ListDevCerts lists development certificates via Apple's v1 JSON services API (matching AltSign).
 func (c *Client) ListDevCerts(teamID, dsid, gsToken string, anisette AnisetteHeaders) ([]DevCert, error) {
-	resp, err := c.postDevService("ios/listAllDevelopmentCerts.action", map[string]any{
-		"teamId": teamID,
+	resp, err := c.sendServicesV1Request(http.MethodGet, "certificates", teamID, map[string]string{
+		"filter[certificateType]": "IOS_DEVELOPMENT",
 	}, dsid, gsToken, anisette)
 	if err != nil {
 		return nil, err
 	}
-	raw, _ := resp["certificates"].([]any)
+	raw, _ := resp["data"].([]any)
 	var out []DevCert
 	for _, item := range raw {
-		if m, ok := item.(map[string]any); ok {
-			certBytes, _ := m["certContent"].([]byte)
-			out = append(out, DevCert{
-				CertID:       fmt.Sprint(m["certificateId"]),
-				Name:         fmt.Sprint(m["name"]),
-				SerialNumber: fmt.Sprint(m["serialNumber"]),
-				CertContent:  certBytes,
-				Status:       fmt.Sprint(m["statusString"]),
-			})
+		m, ok := item.(map[string]any)
+		if !ok {
+			continue
 		}
+		id := fmt.Sprint(m["id"])
+		attrs, _ := m["attributes"].(map[string]any)
+		if attrs == nil {
+			attrs = m
+		}
+		var certDER []byte
+		if b, ok := attrs["certContent"].([]byte); ok {
+			certDER = b
+		} else if s, ok := attrs["certificateContent"].(string); ok && s != "" {
+			certDER, _ = base64.StdEncoding.DecodeString(s)
+		}
+		serial := fmt.Sprint(attrs["serialNumber"])
+		if serial == "" || serial == "<nil>" {
+			serial = fmt.Sprint(attrs["serialNum"])
+		}
+		out = append(out, DevCert{
+			CertID:       id,
+			Name:         fmt.Sprint(attrs["name"]),
+			SerialNumber: serial,
+			MachineName:  fmt.Sprint(attrs["machineName"]),
+			CertContent:  certDER,
+		})
 	}
 	return out, nil
 }
 
-// RevokeDevCert revokes a development certificate by serial number.
-func (c *Client) RevokeDevCert(teamID, serial, dsid, gsToken string, anisette AnisetteHeaders) error {
-	_, err := c.postDevService("ios/revokeDevelopmentCert.action", map[string]any{
-		"teamId":       teamID,
-		"serialNumber": serial,
-	}, dsid, gsToken, anisette)
+// RevokeDevCert revokes a development certificate via Apple's v1 JSON services API (by cert ID) or QH65B2 fallback.
+func (c *Client) RevokeDevCert(teamID, certIDOrSerial, dsid, gsToken string, anisette AnisetteHeaders) error {
+	_, err := c.sendServicesV1Request(http.MethodDelete, "certificates/"+certIDOrSerial, teamID, nil, dsid, gsToken, anisette)
+	if err != nil {
+		_, err2 := c.postDevService("ios/revokeDevelopmentCert.action", map[string]any{
+			"teamId":       teamID,
+			"serialNumber": certIDOrSerial,
+		}, dsid, gsToken, anisette)
+		if err2 == nil {
+			return nil
+		}
+	}
 	return err
 }
 
@@ -647,19 +618,19 @@ func (c *Client) AddDevice(teamID, deviceName, udid, dsid, gsToken string, anise
 		"deviceNumber": udid,
 		"deviceName":   deviceName,
 	}, dsid, gsToken, anisette)
-	if err != nil && (strings.Contains(err.Error(), "already exists") || strings.Contains(err.Error(), "35")) {
+	if err != nil && (strings.Contains(strings.ToLower(err.Error()), "already exists") || strings.Contains(err.Error(), "35")) {
 		return nil
 	}
 	return err
 }
 
-// SubmitDevelopmentCSR submits a CSR to Apple and returns the certificate request/cert ID.
+// SubmitDevelopmentCSR submits a CSR to Apple and returns the certificate ID.
 func (c *Client) SubmitDevelopmentCSR(teamID string, csrPEM []byte, dsid, gsToken string, anisette AnisetteHeaders) (string, error) {
 	resp, err := c.postDevService("ios/submitDevelopmentCSR.action", map[string]any{
-		"teamId":         teamID,
-		"csrContent":     string(csrPEM),
-		"machineId":      anisette.DeviceID,
-		"machineName":    "SignedServer",
+		"teamId":      teamID,
+		"csrContent":  string(csrPEM),
+		"machineId":   strings.ToUpper(uuid.NewString()),
+		"machineName": "SignedServer",
 	}, dsid, gsToken, anisette)
 	if err != nil {
 		return "", err
@@ -733,50 +704,56 @@ func GenerateCSR(commonName string) (privateKeyPEM []byte, csrPEM []byte, err er
 	return privateKeyPEM, csrPEM, nil
 }
 
-func (c *Client) postGSAPlist(payload map[string]any, anisette AnisetteHeaders) (map[string]any, []*http.Cookie, error) {
-	return c.postGSAPlistWithCookies(payload, anisette, nil)
-}
-
-func (c *Client) postGSAPlistWithCookies(payload map[string]any, anisette AnisetteHeaders, cookies []*http.Cookie) (map[string]any, []*http.Cookie, error) {
+func (c *Client) sendGSARequest(requestDict map[string]any, anisette AnisetteHeaders) (map[string]any, error) {
+	payload := map[string]any{
+		"Header":  map[string]any{"Version": "1.0.1"},
+		"Request": requestDict,
+	}
 	var buf bytes.Buffer
-	enc := plist.NewEncoder(&buf)
-	if err := enc.Encode(payload); err != nil {
-		return nil, nil, err
+	if err := plist.NewEncoder(&buf).Encode(payload); err != nil {
+		return nil, err
 	}
 	req, err := http.NewRequest(http.MethodPost, gsaURL, &buf)
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 	req.Header.Set("Content-Type", "text/x-xml-plist")
+	req.Header.Set("X-MMe-Client-Info", anisette.ClientInfo)
 	req.Header.Set("Accept", "*/*")
-	req.Header.Set("User-Agent", "akd/1.0 CFNetwork/1404.0.5 Darwin/22.3.0")
-	c.applyAnisetteHeaders(req, anisette)
-	for _, ck := range cookies {
-		req.AddCookie(ck)
-	}
+	req.Header.Set("User-Agent", "akd/1.0 CFNetwork/978.0.7 Darwin/18.7.0")
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 	defer resp.Body.Close()
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 	var out map[string]any
 	if _, err := plist.Unmarshal(body, &out); err != nil {
-		return nil, nil, fmt.Errorf("plist decode error: %w", err)
+		return nil, fmt.Errorf("GSA plist decode error: %w", err)
 	}
-	return out, resp.Cookies(), nil
+	respDict, ok := out["Response"].(map[string]any)
+	if !ok {
+		return nil, errors.New("missing Response dict in GSA reply")
+	}
+	if status, ok := respDict["Status"].(map[string]any); ok {
+		if ec, _ := toInt(status["ec"]); ec != 0 {
+			em, _ := status["em"].(string)
+			return nil, fmt.Errorf("Apple GSA error (%d): %s", ec, em)
+		}
+	}
+	return respDict, nil
 }
 
 func (c *Client) postDevService(action string, extra map[string]any, dsid, gsToken string, anisette AnisetteHeaders) (map[string]any, error) {
+	normalizeAnisette(&anisette)
 	payload := map[string]any{
-		"clientId":      xcodeClientID,
+		"clientId":        xcodeClientID,
 		"protocolVersion": "QH65B2",
-		"requestId":     strings.ToUpper(uuid.NewString()),
-		"userLocale":    []string{"en_US"},
+		"requestId":       strings.ToUpper(uuid.NewString()),
 	}
 	for k, v := range extra {
 		payload[k] = v
@@ -785,16 +762,19 @@ func (c *Client) postDevService(action string, extra map[string]any, dsid, gsTok
 	if err := plist.NewEncoder(&buf).Encode(payload); err != nil {
 		return nil, err
 	}
-	endpoint := devServicesBaseURL + "/" + strings.TrimLeft(action, "/")
+	endpoint := fmt.Sprintf("%s/%s?clientId=%s", devServicesBaseURL, strings.TrimLeft(action, "/"), xcodeClientID)
 	req, err := http.NewRequest(http.MethodPost, endpoint, &buf)
 	if err != nil {
 		return nil, err
 	}
 	req.Header.Set("Content-Type", "text/x-xml-plist")
-	req.Header.Set("Accept", "text/x-xml-plist")
 	req.Header.Set("User-Agent", xcodeUserAgent)
-	req.Header.Set("X-Apple-GS-Token", gsToken)
+	req.Header.Set("Accept", "text/x-xml-plist")
+	req.Header.Set("Accept-Language", "en-us")
+	req.Header.Set("X-Apple-App-Info", xcodeAppBundleID)
+	req.Header.Set("X-Xcode-Version", xcodeVersion)
 	req.Header.Set("X-Apple-I-Identity-Id", dsid)
+	req.Header.Set("X-Apple-GS-Token", gsToken)
 	c.applyAnisetteHeaders(req, anisette)
 
 	resp, err := c.httpClient.Do(req)
@@ -811,33 +791,98 @@ func (c *Client) postDevService(action string, extra map[string]any, dsid, gsTok
 		return nil, fmt.Errorf("devservices plist error: %w", err)
 	}
 	if rc, ok := toInt(out["resultCode"]); ok && rc != 0 {
-		msg, _ := out["resultString"].(string)
+		msg, _ := out["userString"].(string)
+		if msg == "" {
+			msg, _ = out["resultString"].(string)
+		}
 		return nil, fmt.Errorf("Apple DevServices error (%d): %s", rc, msg)
 	}
 	return out, nil
 }
 
+func (c *Client) sendServicesV1Request(methodOverride, path, teamID string, extraParams map[string]string, dsid, gsToken string, anisette AnisetteHeaders) (map[string]any, error) {
+	normalizeAnisette(&anisette)
+	q := url.Values{}
+	if teamID != "" {
+		q.Set("teamId", teamID)
+	}
+	for k, v := range extraParams {
+		q.Set(k, v)
+	}
+	bodyBytes, _ := json.Marshal(map[string]string{
+		"urlEncodedQueryParams": q.Encode(),
+	})
+
+	endpoint := fmt.Sprintf("%s/%s", servicesV1BaseURL, strings.TrimLeft(path, "/"))
+	req, err := http.NewRequest(http.MethodPost, endpoint, bytes.NewReader(bodyBytes))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/vnd.api+json")
+	req.Header.Set("User-Agent", xcodeUserAgent)
+	req.Header.Set("Accept", "application/vnd.api+json")
+	req.Header.Set("Accept-Language", "en-us")
+	req.Header.Set("X-Apple-App-Info", xcodeAppBundleID)
+	req.Header.Set("X-Xcode-Version", xcodeVersion)
+	req.Header.Set("X-HTTP-Method-Override", methodOverride)
+	req.Header.Set("X-Apple-I-Identity-Id", dsid)
+	req.Header.Set("X-Apple-GS-Token", gsToken)
+	c.applyAnisetteHeaders(req, anisette)
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+	if len(body) == 0 {
+		return map[string]any{}, nil
+	}
+	var out map[string]any
+	if err := json.Unmarshal(body, &out); err != nil {
+		return nil, fmt.Errorf("services v1 json error: %w", err)
+	}
+	if rc, ok := toInt(out["resultCode"]); ok && rc != 0 {
+		msg, _ := out["userString"].(string)
+		if msg == "" {
+			msg, _ = out["resultString"].(string)
+		}
+		return nil, fmt.Errorf("Apple Services v1 error (%d): %s", rc, msg)
+	}
+	return out, nil
+}
+
 func (c *Client) applyAnisetteHeaders(req *http.Request, a AnisetteHeaders) {
-	if a.MachineID != "" {
-		req.Header.Set("X-Apple-I-MD", a.MachineID)
-	}
 	if a.OneTimePassword != "" {
-		req.Header.Set("X-Apple-I-MD-M", a.OneTimePassword)
+		req.Header.Set("X-Apple-I-MD", a.OneTimePassword)
 	}
-	if a.RoutingInfo != "" {
-		req.Header.Set("X-Apple-I-MD-RINFO", a.RoutingInfo)
+	if a.MachineID != "" {
+		req.Header.Set("X-Apple-I-MD-M", a.MachineID)
 	}
 	if a.LocalUserID != "" {
 		req.Header.Set("X-Apple-I-MD-LU", a.LocalUserID)
+	}
+	if a.RoutingInfo != "" {
+		req.Header.Set("X-Apple-I-MD-RINFO", a.RoutingInfo)
 	}
 	if a.DeviceID != "" {
 		req.Header.Set("X-Mme-Device-Id", a.DeviceID)
 	}
 	if a.ClientInfo != "" {
-		req.Header.Set("X-Mme-Client-Info", a.ClientInfo)
+		req.Header.Set("X-MMe-Client-Info", a.ClientInfo)
 	}
 	if a.ClientTime != "" {
 		req.Header.Set("X-Apple-I-Client-Time", a.ClientTime)
+	}
+	if a.Locale != "" {
+		req.Header.Set("X-Apple-Locale", a.Locale)
+		req.Header.Set("X-Apple-I-Locale", a.Locale)
+	}
+	if a.TimeZone != "" {
+		req.Header.Set("X-Apple-I-TimeZone", a.TimeZone)
 	}
 }
 
@@ -859,7 +904,6 @@ func decryptSPD(sessionKey, spdEnc []byte) (map[string]any, error) {
 	}
 	plain := make([]byte, len(spdEnc))
 	cipher.NewCBCDecrypter(block, iv).CryptBlocks(plain, spdEnc)
-	// PKCS7 unpad
 	if len(plain) > 0 {
 		pad := int(plain[len(plain)-1])
 		if pad > 0 && pad <= aes.BlockSize && pad <= len(plain) {
@@ -871,6 +915,28 @@ func decryptSPD(sessionKey, spdEnc []byte) (map[string]any, error) {
 		return nil, err
 	}
 	return out, nil
+}
+
+// decryptETGCM decrypts GSA apptokens "et" data using AES-256-GCM with 16-byte IV and "XYZ" header AAD (matching AltSign ALTDecryptDataGCM).
+func decryptETGCM(sk, encryptedData []byte) ([]byte, error) {
+	if len(encryptedData) < 35 {
+		return nil, errors.New("encrypted token too short")
+	}
+	if string(encryptedData[:3]) != "XYZ" {
+		return nil, errors.New("encrypted token wrong version header")
+	}
+	block, err := aes.NewCipher(sk)
+	if err != nil {
+		return nil, err
+	}
+	gcm, err := cipher.NewGCMWithNonceSize(block, 16)
+	if err != nil {
+		return nil, err
+	}
+	aad := encryptedData[:3]
+	iv := encryptedData[3:19]
+	ciphertextAndTag := encryptedData[19:]
+	return gcm.Open(nil, iv, ciphertextAndTag, aad)
 }
 
 func padBigInt(v *big.Int, size int) []byte {
@@ -891,6 +957,13 @@ func toInt(v any) (int, bool) {
 		return int(t), true
 	case uint64:
 		return int(t), true
+	case float64:
+		return int(t), true
+	case string:
+		if n, err := strconv.Atoi(t); err == nil {
+			return n, true
+		}
+		return 0, false
 	default:
 		return 0, false
 	}

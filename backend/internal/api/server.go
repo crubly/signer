@@ -309,6 +309,12 @@ func (s *Server) handleApple2FA(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) syncTeamsAndSave(uid string, acc *store.Account, anisette apple.AnisetteHeaders) {
+	if acc.SessionData == nil {
+		acc.SessionData = map[string]string{}
+	}
+	if aniBytes, err := json.Marshal(anisette); err == nil {
+		acc.SessionData["anisette"] = string(aniBytes)
+	}
 	teams, err := s.apple.ListTeams(acc.DSID, acc.GSToken, anisette)
 	if err != nil {
 		log.Printf("apple ListTeams error for %s: %v", acc.AppleID, err)
@@ -324,11 +330,23 @@ func (s *Server) syncTeamsAndSave(uid string, acc *store.Account, anisette apple
 	_ = s.store.SaveAppleAccount(*acc)
 }
 
+func (s *Server) accountAnisette(acc *store.Account) (apple.AnisetteHeaders, error) {
+	if acc != nil && acc.SessionData != nil {
+		if raw := acc.SessionData["anisette"]; raw != "" {
+			var h apple.AnisetteHeaders
+			if err := json.Unmarshal([]byte(raw), &h); err == nil && h.MachineID != "" {
+				return h, nil
+			}
+		}
+	}
+	return s.apple.FetchAnisette()
+}
+
 func (s *Server) handleListAppIDs(w http.ResponseWriter, r *http.Request) {
 	uid := currentUserID(r)
 	acc, _ := s.store.GetAppleAccount(uid)
 	if acc != nil && acc.LoggedIn && acc.TeamID != "" {
-		if anisette, err := s.apple.FetchAnisette(); err == nil {
+		if anisette, err := s.accountAnisette(acc); err == nil {
 			if ids, err := s.apple.ListAppIDs(acc.TeamID, acc.DSID, acc.GSToken, anisette); err == nil {
 				records := make([]store.AppIDRecord, 0, len(ids))
 				for _, id := range ids {
@@ -358,7 +376,7 @@ func (s *Server) handleDeleteAppID(w http.ResponseWriter, r *http.Request) {
 	appIDID := r.PathValue("id")
 	acc, _ := s.store.GetAppleAccount(uid)
 	if acc != nil && acc.LoggedIn && acc.TeamID != "" {
-		if anisette, err := s.apple.FetchAnisette(); err == nil {
+		if anisette, err := s.accountAnisette(acc); err == nil {
 			_ = s.apple.DeleteAppID(acc.TeamID, appIDID, acc.DSID, acc.GSToken, anisette)
 		}
 	}
@@ -667,7 +685,7 @@ func (s *Server) ensureAppleProvisioning(uid, bundleID, appName string) (*store.
 		return nil, bundleID, errors.New("Apple ID session missing; sign in with Apple ID")
 	}
 
-	anisette, err := s.apple.FetchAnisette()
+	anisette, err := s.accountAnisette(acc)
 	if err != nil {
 		return nil, bundleID, err
 	}
@@ -699,7 +717,11 @@ func (s *Server) ensureAppleProvisioning(uid, bundleID, appName string) (*store.
 	if err != nil {
 		// If max certificates reached, revoke oldest dev cert and retry
 		if certs, lerr := s.apple.ListDevCerts(acc.TeamID, acc.DSID, acc.GSToken, anisette); lerr == nil && len(certs) > 0 {
-			_ = s.apple.RevokeDevCert(acc.TeamID, certs[0].SerialNumber, acc.DSID, acc.GSToken, anisette)
+			revTarget := certs[0].CertID
+			if revTarget == "" {
+				revTarget = certs[0].SerialNumber
+			}
+			_ = s.apple.RevokeDevCert(acc.TeamID, revTarget, acc.DSID, acc.GSToken, anisette)
 			certIDFromApple, err = s.apple.SubmitDevelopmentCSR(acc.TeamID, csrPEM, acc.DSID, acc.GSToken, anisette)
 		}
 		if err != nil {
