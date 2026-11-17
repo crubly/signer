@@ -229,9 +229,10 @@ func (s *Server) handleAppleLogin(w http.ResponseWriter, r *http.Request) {
 		s.pendingMu.Unlock()
 		_ = s.store.SaveAppleAccount(acc)
 		writeJSON(w, http.StatusOK, map[string]any{
-			"needs_2fa":  true,
-			"session_id": sessionID,
-			"account":    acc,
+			"needs_2fa":   true,
+			"auth_method": res.AuthMethod,
+			"session_id":  sessionID,
+			"account":     acc,
 		})
 		return
 	}

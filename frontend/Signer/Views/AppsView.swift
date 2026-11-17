@@ -8,6 +8,7 @@ struct AppsView: View {
     @State private var ipaURLText = ""
     @State private var appToSign: SignedApp?
     @State private var isBusy = false
+    @State private var isVisible = false
 
     var activeApps: [SignedApp] {
         api.apps.filter { $0.status == "signed" }
@@ -179,8 +180,10 @@ struct AppsView: View {
             .sheet(item: $appToSign) { app in
                 SignAppSheet(app: app)
             }
+            .onAppear { isVisible = true }
+            .onDisappear { isVisible = false }
             .alert("Error", isPresented: Binding(
-                get: { api.errorMessage != nil },
+                get: { isVisible && api.errorMessage != nil && appToSign == nil },
                 set: { if !$0 { api.errorMessage = nil } }
             )) {
                 Button("OK", role: .cancel) { api.errorMessage = nil }

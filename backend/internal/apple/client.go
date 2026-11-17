@@ -34,6 +34,8 @@ const (
 	gsaURL             = "https://gsa.apple.com/grandslam/GsService2"
 	gsaValidateURL     = "https://gsa.apple.com/grandslam/GsService2/validate"
 	gsaTrustedDevURL   = "https://gsa.apple.com/auth/verify/trusteddevice"
+	gsaSMSRequestURL   = "https://gsa.apple.com/auth/verify/phone/put?mode=sms"
+	gsaSMSVerifyURL    = "https://gsa.apple.com/auth/verify/phone/securitycode?referrer=/auth/verify/phone/put"
 	devServicesBaseURL = "https://developerservices2.apple.com/services/QH65B2"
 	servicesV1BaseURL  = "https://developerservices2.apple.com/services/v1"
 	xcodeClientID      = "XABBG36SBA"
@@ -80,10 +82,12 @@ type PendingAuth struct {
 	SessionID string
 	DSID      string
 	IDMSToken string
+	AuthType  string // "trustedDeviceSecondaryAuth" or "secondaryAuth" (SMS)
 }
 
 type AuthResult struct {
 	Needs2FA bool
+	AuthMethod string // "trusted_device" or "sms"
 	DSID     string
 	GSToken  string
 	Anisette AnisetteHeaders
@@ -345,11 +349,20 @@ func (c *Client) startLoginWithAnisette(appleID, password string, anisette Anise
 				Anisette:  anisette,
 				DSID:      adsid,
 				IDMSToken: idmsToken,
+				AuthType:  au,
 			}
-			if err := c.requestTrustedDevice2FA(pending); err != nil {
-				log.Printf("requestTrustedDevice2FA warning: %v", err)
+			method := "trusted_device"
+			if au == "secondaryAuth" {
+				method = "sms"
+				if err := c.requestSMS2FA(pending); err != nil {
+					log.Printf("requestSMS2FA warning: %v", err)
+				}
+			} else {
+				if err := c.requestTrustedDevice2FA(pending); err != nil {
+					log.Printf("requestTrustedDevice2FA warning: %v", err)
+				}
 			}
-			return &AuthResult{Needs2FA: true, DSID: adsid, Anisette: anisette}, pending, nil
+			return &AuthResult{Needs2FA: true, AuthMethod: method, DSID: adsid, Anisette: anisette}, pending, nil
 		}
 	}
 
@@ -400,40 +413,47 @@ func (c *Client) requestTrustedDevice2FA(p *PendingAuth) error {
 	return nil
 }
 
-// Submit2FA validates the 6-digit code via GsService2/validate (matching AltSign),
+func (c *Client) requestSMS2FA(p *PendingAuth) error {
+	bodyXML := map[string]any{
+		"serverInfo": map[string]any{
+			"phoneNumber.id": "1",
+		},
+	}
+	var buf bytes.Buffer
+	if err := plist.NewEncoder(&buf).Encode(bodyXML); err != nil {
+		return err
+	}
+	req, err := http.NewRequest(http.MethodPost, gsaSMSRequestURL, &buf)
+	if err != nil {
+		return err
+	}
+	normalizeAnisette(&p.Anisette)
+	c.apply2FAHeaders(req, p.DSID, p.IDMSToken, p.Anisette)
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	_, _ = io.Copy(io.Discard, resp.Body)
+	return nil
+}
+
+// Submit2FA validates the 6-digit code via GsService2/validate (trusted device) or /auth/verify/phone/securitycode (SMS),
 // then restarts SRP authentication using the now-trusted Anisette data to fetch the Xcode GS token.
 func (c *Client) Submit2FA(p *PendingAuth, code string) (*AuthResult, error) {
 	if p == nil {
 		return nil, errors.New("no pending 2FA session")
 	}
-	req, err := http.NewRequest(http.MethodGet, gsaValidateURL, nil)
-	if err != nil {
-		return nil, err
-	}
 	normalizeAnisette(&p.Anisette)
-	c.apply2FAHeaders(req, p.DSID, p.IDMSToken, p.Anisette)
-	req.Header.Set("security-code", code)
 
-	resp, err := c.httpClient.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, err
-	}
-
-	var valDict map[string]any
-	if _, err := plist.Unmarshal(body, &valDict); err != nil {
-		return nil, fmt.Errorf("2FA validate plist decode error (HTTP %d): %w", resp.StatusCode, err)
-	}
-	if ec, ok := toInt(valDict["ec"]); ok && ec != 0 {
-		em, _ := valDict["em"].(string)
-		if ec == -21669 {
-			return nil, errors.New("incorrect 2FA verification code")
+	if p.AuthType == "secondaryAuth" {
+		if err := c.verifySMS2FA(p, code); err != nil {
+			return nil, err
 		}
-		return nil, fmt.Errorf("2FA validate error (%d): %s", ec, em)
+	} else {
+		if err := c.verifyTrustedDevice2FA(p, code); err != nil {
+			return nil, err
+		}
 	}
 
 	// Restart authentication with the same Anisette — now 2FA-trusted on GSA!
@@ -445,6 +465,69 @@ func (c *Client) Submit2FA(p *PendingAuth, code string) (*AuthResult, error) {
 		return nil, errors.New("Apple still requested 2FA after code validation")
 	}
 	return res, nil
+}
+
+func (c *Client) verifyTrustedDevice2FA(p *PendingAuth, code string) error {
+	req, err := http.NewRequest(http.MethodGet, gsaValidateURL, nil)
+	if err != nil {
+		return err
+	}
+	c.apply2FAHeaders(req, p.DSID, p.IDMSToken, p.Anisette)
+	req.Header.Set("security-code", code)
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return err
+	}
+
+	var valDict map[string]any
+	if _, err := plist.Unmarshal(body, &valDict); err != nil {
+		return fmt.Errorf("2FA validate plist decode error (HTTP %d): %w", resp.StatusCode, err)
+	}
+	if ec, ok := toInt(valDict["ec"]); ok && ec != 0 {
+		em, _ := valDict["em"].(string)
+		if ec == -21669 {
+			return errors.New("incorrect 2FA verification code")
+		}
+		return fmt.Errorf("2FA validate error (%d): %s", ec, em)
+	}
+	return nil
+}
+
+func (c *Client) verifySMS2FA(p *PendingAuth, code string) error {
+	bodyXML := map[string]any{
+		"securityCode.code": code,
+		"serverInfo": map[string]any{
+			"mode":           "sms",
+			"phoneNumber.id": "1",
+		},
+	}
+	var buf bytes.Buffer
+	if err := plist.NewEncoder(&buf).Encode(bodyXML); err != nil {
+		return err
+	}
+	req, err := http.NewRequest(http.MethodPost, gsaSMSVerifyURL, &buf)
+	if err != nil {
+		return err
+	}
+	c.apply2FAHeaders(req, p.DSID, p.IDMSToken, p.Anisette)
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 2048))
+
+	if resp.StatusCode != http.StatusOK || resp.Header.Get("X-Apple-PE-Token") == "" {
+		return fmt.Errorf("incorrect or expired SMS verification code (HTTP %d): %s", resp.StatusCode, strings.TrimSpace(string(body)))
+	}
+	return nil
 }
 
 func (c *Client) fetchXcodeAuthToken(adsid, idmsToken string, sk []byte, cVal any, cpdDict map[string]any, anisette AnisetteHeaders) (string, error) {
