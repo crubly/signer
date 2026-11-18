@@ -632,60 +632,95 @@ func (c *Client) DeleteAppID(teamID, appIDID, dsid, gsToken string, anisette Ani
 	return err
 }
 
-// ListDevCerts lists development certificates via Apple's v1 JSON services API (matching AltSign).
+// ListDevCerts lists development certificates via v1 JSON services API, falling back to QH65B2 listAllDevelopmentCerts.action.
 func (c *Client) ListDevCerts(teamID, dsid, gsToken string, anisette AnisetteHeaders) ([]DevCert, error) {
 	resp, err := c.sendServicesV1Request(http.MethodGet, "certificates", teamID, map[string]string{
 		"filter[certificateType]": "IOS_DEVELOPMENT",
 	}, dsid, gsToken, anisette)
-	if err != nil {
-		return nil, err
-	}
-	raw, _ := resp["data"].([]any)
 	var out []DevCert
-	for _, item := range raw {
-		m, ok := item.(map[string]any)
-		if !ok {
-			continue
+	if err == nil {
+		raw, _ := resp["data"].([]any)
+		for _, item := range raw {
+			m, ok := item.(map[string]any)
+			if !ok {
+				continue
+			}
+			id := fmt.Sprint(m["id"])
+			attrs, _ := m["attributes"].(map[string]any)
+			if attrs == nil {
+				attrs = m
+			}
+			var certDER []byte
+			if b, ok := attrs["certContent"].([]byte); ok {
+				certDER = b
+			} else if s, ok := attrs["certificateContent"].(string); ok && s != "" {
+				certDER, _ = base64.StdEncoding.DecodeString(s)
+			}
+			serial := fmt.Sprint(attrs["serialNumber"])
+			if serial == "" || serial == "<nil>" {
+				serial = fmt.Sprint(attrs["serialNum"])
+			}
+			out = append(out, DevCert{
+				CertID:       id,
+				Name:         fmt.Sprint(attrs["name"]),
+				SerialNumber: serial,
+				MachineName:  fmt.Sprint(attrs["machineName"]),
+				CertContent:  certDER,
+			})
 		}
-		id := fmt.Sprint(m["id"])
-		attrs, _ := m["attributes"].(map[string]any)
-		if attrs == nil {
-			attrs = m
+	} else {
+		log.Printf("ListDevCerts v1 failed (%v), falling back to QH65B2", err)
+	}
+
+	if len(out) == 0 {
+		resp2, err2 := c.postDevService("ios/listAllDevelopmentCerts.action", map[string]any{
+			"teamId": teamID,
+		}, dsid, gsToken, anisette)
+		if err2 != nil {
+			if err != nil {
+				return nil, fmt.Errorf("v1: %v; qh65b2: %w", err, err2)
+			}
+			return nil, err2
 		}
-		var certDER []byte
-		if b, ok := attrs["certContent"].([]byte); ok {
-			certDER = b
-		} else if s, ok := attrs["certificateContent"].(string); ok && s != "" {
-			certDER, _ = base64.StdEncoding.DecodeString(s)
+		raw2, _ := resp2["certificates"].([]any)
+		for _, item := range raw2 {
+			if m, ok := item.(map[string]any); ok {
+				certBytes, _ := m["certContent"].([]byte)
+				out = append(out, DevCert{
+					CertID:       fmt.Sprint(m["certificateId"]),
+					Name:         fmt.Sprint(m["name"]),
+					SerialNumber: fmt.Sprint(m["serialNumber"]),
+					MachineName:  fmt.Sprint(m["machineName"]),
+					CertContent:  certBytes,
+				})
+			}
 		}
-		serial := fmt.Sprint(attrs["serialNumber"])
-		if serial == "" || serial == "<nil>" {
-			serial = fmt.Sprint(attrs["serialNum"])
-		}
-		out = append(out, DevCert{
-			CertID:       id,
-			Name:         fmt.Sprint(attrs["name"]),
-			SerialNumber: serial,
-			MachineName:  fmt.Sprint(attrs["machineName"]),
-			CertContent:  certDER,
-		})
 	}
 	return out, nil
 }
 
-// RevokeDevCert revokes a development certificate via Apple's v1 JSON services API (by cert ID) or QH65B2 fallback.
-func (c *Client) RevokeDevCert(teamID, certIDOrSerial, dsid, gsToken string, anisette AnisetteHeaders) error {
-	_, err := c.sendServicesV1Request(http.MethodDelete, "certificates/"+certIDOrSerial, teamID, nil, dsid, gsToken, anisette)
-	if err != nil {
-		_, err2 := c.postDevService("ios/revokeDevelopmentCert.action", map[string]any{
+// RevokeDevCert revokes a development certificate by v1 cert ID and/or QH65B2 serialNumber.
+func (c *Client) RevokeDevCert(teamID, certID, serial, dsid, gsToken string, anisette AnisetteHeaders) error {
+	var err1, err2 error
+	if certID != "" && certID != "<nil>" {
+		_, err1 = c.sendServicesV1Request(http.MethodDelete, "certificates/"+certID, teamID, nil, dsid, gsToken, anisette)
+		if err1 == nil {
+			return nil
+		}
+	}
+	if serial != "" && serial != "<nil>" {
+		_, err2 = c.postDevService("ios/revokeDevelopmentCert.action", map[string]any{
 			"teamId":       teamID,
-			"serialNumber": certIDOrSerial,
+			"serialNumber": serial,
 		}, dsid, gsToken, anisette)
 		if err2 == nil {
 			return nil
 		}
 	}
-	return err
+	if err2 != nil {
+		return err2
+	}
+	return err1
 }
 
 // AddDevice registers an iOS device UDID under the Apple Developer team (ignores already-registered errors).

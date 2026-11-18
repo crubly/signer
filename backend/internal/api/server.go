@@ -716,13 +716,15 @@ func (s *Server) ensureAppleProvisioning(uid, bundleID, appName string) (*store.
 
 	certIDFromApple, err := s.apple.SubmitDevelopmentCSR(acc.TeamID, csrPEM, acc.DSID, acc.GSToken, anisette)
 	if err != nil {
-		// If max certificates reached, revoke oldest dev cert and retry
-		if certs, lerr := s.apple.ListDevCerts(acc.TeamID, acc.DSID, acc.GSToken, anisette); lerr == nil && len(certs) > 0 {
-			revTarget := certs[0].CertID
-			if revTarget == "" {
-				revTarget = certs[0].SerialNumber
+		log.Printf("SubmitDevelopmentCSR failed (%v), attempting to list & revoke existing cert", err)
+		certs, lerr := s.apple.ListDevCerts(acc.TeamID, acc.DSID, acc.GSToken, anisette)
+		log.Printf("ListDevCerts result: err=%v, count=%d", lerr, len(certs))
+		if lerr == nil && len(certs) > 0 {
+			for _, dc := range certs {
+				if rerr := s.apple.RevokeDevCert(acc.TeamID, dc.CertID, dc.SerialNumber, acc.DSID, acc.GSToken, anisette); rerr != nil {
+					log.Printf("RevokeDevCert (%s/%s) failed: %v", dc.CertID, dc.SerialNumber, rerr)
+				}
 			}
-			_ = s.apple.RevokeDevCert(acc.TeamID, revTarget, acc.DSID, acc.GSToken, anisette)
 			certIDFromApple, err = s.apple.SubmitDevelopmentCSR(acc.TeamID, csrPEM, acc.DSID, acc.GSToken, anisette)
 		}
 		if err != nil {
