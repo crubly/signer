@@ -65,6 +65,7 @@ func (s *Server) Handler() http.Handler {
 
 	// Apple Developer Account & App IDs
 	mux.Handle("GET /api/apple/account", s.requireAuth(http.HandlerFunc(s.handleGetAppleAccount)))
+	mux.Handle("PUT /api/apple/device", s.requireAuth(http.HandlerFunc(s.handleUpdateDeviceUDID)))
 	mux.Handle("GET /api/apple/app-ids", s.requireAuth(http.HandlerFunc(s.handleListAppIDs)))
 	mux.Handle("DELETE /api/apple/app-ids/{id}", s.requireAuth(http.HandlerFunc(s.handleDeleteAppID)))
 
@@ -177,6 +178,39 @@ func (s *Server) handleGetAppleAccount(w http.ResponseWriter, r *http.Request) {
 	if acc == nil {
 		writeJSON(w, http.StatusOK, map[string]any{"logged_in": false})
 		return
+	}
+	writeJSON(w, http.StatusOK, acc)
+}
+
+func (s *Server) handleUpdateDeviceUDID(w http.ResponseWriter, r *http.Request) {
+	uid := currentUserID(r)
+	var body struct {
+		DeviceUDID string `json:"device_udid"`
+		DeviceName string `json:"device_name"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil || strings.TrimSpace(body.DeviceUDID) == "" {
+		writeErr(w, http.StatusBadRequest, "device_udid required")
+		return
+	}
+	acc, err := s.store.GetAppleAccount(uid)
+	if err != nil || acc == nil {
+		writeErr(w, http.StatusNotFound, "apple account not found")
+		return
+	}
+	acc.DeviceUDID = strings.TrimSpace(body.DeviceUDID)
+	if body.DeviceName != "" {
+		acc.DeviceName = body.DeviceName
+	}
+	if err := s.store.SaveAppleAccount(*acc); err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if acc.LoggedIn && acc.TeamID != "" {
+		if anisette, err := s.accountAnisette(acc); err == nil {
+			if derr := s.apple.AddDevice(acc.TeamID, acc.DeviceName, acc.DeviceUDID, acc.DSID, acc.GSToken, anisette); derr != nil {
+				log.Printf("AddDevice on update (%s): %v", acc.DeviceUDID, derr)
+			}
+		}
 	}
 	writeJSON(w, http.StatusOK, acc)
 }
@@ -613,12 +647,14 @@ func (s *Server) handleSignApp(w http.ResponseWriter, r *http.Request) {
 
 	baseURL := strings.TrimRight(s.effectivePublicURL(r), "/")
 	manifestURL := fmt.Sprintf("%s/ota/%s/manifest.plist", baseURL, app.ID)
+	ipaURL := fmt.Sprintf("%s/ota/%s/app.ipa", baseURL, app.ID)
 	otaURL := "itms-services://?action=download-manifest&url=" + url.QueryEscape(manifestURL)
 
 	writeJSON(w, http.StatusOK, map[string]any{
 		"app":          app,
 		"ota_url":      otaURL,
 		"manifest_url": manifestURL,
+		"ipa_url":      ipaURL,
 	})
 }
 
@@ -673,10 +709,12 @@ func (s *Server) handleRenewApp(w http.ResponseWriter, r *http.Request) {
 
 	baseURL := strings.TrimRight(s.effectivePublicURL(r), "/")
 	manifestURL := fmt.Sprintf("%s/ota/%s/manifest.plist", baseURL, app.ID)
+	ipaURL := fmt.Sprintf("%s/ota/%s/app.ipa", baseURL, app.ID)
 	otaURL := "itms-services://?action=download-manifest&url=" + url.QueryEscape(manifestURL)
 	writeJSON(w, http.StatusOK, map[string]any{
 		"app":     app,
 		"ota_url": otaURL,
+		"ipa_url": ipaURL,
 	})
 }
 
@@ -706,7 +744,9 @@ func (s *Server) ensureAppleProvisioning(uid, bundleID, appName string) (*store.
 		_ = s.store.SaveAppleAccount(*acc)
 	}
 
-	_ = s.apple.AddDevice(acc.TeamID, acc.DeviceName, acc.DeviceUDID, acc.DSID, acc.GSToken, anisette)
+	if err := s.apple.AddDevice(acc.TeamID, acc.DeviceName, acc.DeviceUDID, acc.DSID, acc.GSToken, anisette); err != nil {
+		log.Printf("AddDevice (%s) warning: %v", acc.DeviceUDID, err)
+	}
 
 	// Generate RSA key + CSR and submit to Apple
 	privPEM, csrPEM, err := apple.GenerateCSR("Signed")
@@ -978,11 +1018,13 @@ func writeJSON(w http.ResponseWriter, code int, v any) {
 }
 
 func writeErr(w http.ResponseWriter, code int, msg string) {
+	log.Printf("API error %d: %s", code, msg)
 	writeJSON(w, code, map[string]string{"error": msg})
 }
 
 func corsMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		log.Printf("HTTP %s %s", r.Method, r.URL.Path)
 		w.Header().Set("Access-Control-Allow-Origin", "*")
 		w.Header().Set("Access-Control-Allow-Headers", "Authorization, Content-Type")
 		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")

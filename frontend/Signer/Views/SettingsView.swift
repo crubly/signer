@@ -1,8 +1,12 @@
 import SwiftUI
+import UniformTypeIdentifiers
 
 struct SettingsView: View {
     @EnvironmentObject var api: APIClient
+    @StateObject private var installer = DeviceInstaller.shared
     @State private var showAppleLogin = false
+    @State private var showPairingImporter = false
+    @State private var pairingStatusMessage: String?
     @State private var ntfyURL = ""
     @State private var webhookURL = ""
     @State private var warningHours = 24
@@ -29,6 +33,53 @@ struct SettingsView: View {
                     Button("Sign Out", role: .destructive) {
                         api.logout()
                     }
+                }
+
+                Section {
+                    if installer.hasPairingFile {
+                        HStack {
+                            Image(systemName: "checkmark.circle.fill")
+                                .foregroundStyle(.green)
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text("Pairing File Loaded")
+                                    .font(.subheadline.weight(.semibold))
+                                if let udid = installer.deviceUDID {
+                                    Text("UDID: \(udid)")
+                                        .font(.caption2)
+                                        .foregroundStyle(.secondary)
+                                }
+                            }
+                        }
+                    } else {
+                        Label("No Pairing File Imported", systemImage: "exclamationmark.triangle.fill")
+                            .foregroundStyle(.orange)
+                            .font(.subheadline)
+                    }
+
+                    Button(installer.hasPairingFile ? "Replace Pairing File" : "Import Pairing File (.mobiledevicepairing)") {
+                        showPairingImporter = true
+                    }
+
+                    if installer.hasPairingFile {
+                        Button("Remove Pairing File", role: .destructive) {
+                            installer.clearPairingFile()
+                        }
+                    }
+
+                    TextField("Loopback VPN IP (StosVPN)", text: $installer.vpnIP)
+                        .keyboardType(.numbersAndPunctuation)
+                        .autocorrectionDisabled()
+                        .textInputAutocapitalization(.never)
+
+                    if let msg = pairingStatusMessage {
+                        Text(msg)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                } header: {
+                    Text("Device Pairing (SideStore Mode)")
+                } footer: {
+                    Text("For free Apple IDs: generate a .mobiledevicepairing file once via JitterbugPair, import it here, and turn on StosVPN (10.7.0.1) before installing or renewing apps.")
                 }
 
                 Section("Expiration & Push Alerts") {
@@ -92,6 +143,28 @@ struct SettingsView: View {
             }
             .sheet(isPresented: $showAppleLogin) {
                 AppleLoginSheet()
+            }
+            .fileImporter(
+                isPresented: $showPairingImporter,
+                allowedContentTypes: [.data, .propertyList, .xml]
+            ) { result in
+                switch result {
+                case .success(let url):
+                    do {
+                        let udid = try installer.importPairingFile(from: url)
+                        pairingStatusMessage = "Pairing file saved!"
+                        if let udid, !udid.isEmpty {
+                            Task {
+                                await api.updateDeviceUDID(udid)
+                                pairingStatusMessage = "Pairing file saved & UDID synced to server."
+                            }
+                        }
+                    } catch {
+                        pairingStatusMessage = error.localizedDescription
+                    }
+                case .failure(let err):
+                    pairingStatusMessage = err.localizedDescription
+                }
             }
         }
     }

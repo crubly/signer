@@ -84,7 +84,7 @@ final class APIClient: ObservableObject {
     func appleLogin(appleID: String, password: String) async -> Bool {
         errorMessage = nil
         do {
-            let udid = UIDevice.current.identifierForVendor?.uuidString ?? UUID().uuidString
+            let udid = DeviceInstaller.shared.deviceUDID ?? UIDevice.current.identifierForVendor?.uuidString ?? UUID().uuidString
             let payload: [String: String] = [
                 "apple_id": appleID,
                 "password": password,
@@ -147,6 +147,19 @@ final class APIClient: ObservableObject {
         } catch {
             self.errorMessage = error.localizedDescription
             return false
+        }
+    }
+
+    func updateDeviceUDID(_ udid: String) async {
+        do {
+            let body = try JSONEncoder().encode([
+                "device_udid": udid,
+                "device_name": UIDevice.current.name
+            ])
+            let data = try await request("PUT", "/api/apple/device", body: body)
+            self.appleAccount = try decoder.decode(AppleAccount.self, from: data)
+        } catch {
+            self.errorMessage = error.localizedDescription
         }
     }
 

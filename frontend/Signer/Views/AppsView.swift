@@ -8,7 +8,30 @@ struct AppsView: View {
     @State private var ipaURLText = ""
     @State private var appToSign: SignedApp?
     @State private var isBusy = false
+    @State private var busyMessage = "Working on server..."
     @State private var isVisible = false
+
+    private func installSignedApp(appID: String, ipaURLString: String?, otaURLString: String?) async {
+        let base = api.serverURL.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+        let ipaStr = ipaURLString ?? "\(base)/ota/\(appID)/app.ipa"
+        if DeviceInstaller.shared.hasPairingFile, let ipaURL = URL(string: ipaStr) {
+            do {
+                try await DeviceInstaller.shared.installIPA(from: ipaURL, appID: appID) { msg in
+                    busyMessage = msg
+                }
+            } catch {
+                api.errorMessage = error.localizedDescription
+            }
+        } else if let otaStr = otaURLString, let url = URL(string: otaStr) {
+            await UIApplication.shared.open(url)
+        } else {
+            let manifest = "\(base)/ota/\(appID)/manifest.plist"
+            if let encoded = manifest.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed),
+               let ota = URL(string: "itms-services://?action=download-manifest&url=\(encoded)") {
+                await UIApplication.shared.open(ota)
+            }
+        }
+    }
 
     var activeApps: [SignedApp] {
         api.apps.filter { $0.status == "signed" }
@@ -62,25 +85,26 @@ struct AppsView: View {
                                     appToSign = app
                                 }, onRenew: {
                                     Task {
+                                        busyMessage = "Signing on server..."
                                         isBusy = true
-                                        if let res = await api.renewApp(id: app.id),
-                                           let url = URL(string: res.otaURL) {
-                                            await UIApplication.shared.open(url)
+                                        if let res = await api.renewApp(id: app.id) {
+                                            await installSignedApp(appID: app.id, ipaURLString: res.ipaURL, otaURLString: res.otaURL)
                                         }
                                         isBusy = false
                                     }
                                 }, onToggleActive: {
                                     Task {
+                                        busyMessage = "Deactivating..."
                                         isBusy = true
                                         await api.deactivateApp(id: app.id)
                                         isBusy = false
                                     }
                                 }, onInstall: {
-                                    let base = api.serverURL.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
-                                    let manifest = "\(base)/ota/\(app.id)/manifest.plist"
-                                    if let encoded = manifest.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed),
-                                       let ota = URL(string: "itms-services://?action=download-manifest&url=\(encoded)") {
-                                        UIApplication.shared.open(ota)
+                                    Task {
+                                        busyMessage = "Installing..."
+                                        isBusy = true
+                                        await installSignedApp(appID: app.id, ipaURLString: nil, otaURLString: nil)
+                                        isBusy = false
                                     }
                                 })
                             }
@@ -100,19 +124,19 @@ struct AppsView: View {
                                     appToSign = app
                                 }, onRenew: {
                                     Task {
+                                        busyMessage = "Signing on server..."
                                         isBusy = true
-                                        if let res = await api.activateApp(id: app.id),
-                                           let url = URL(string: res.otaURL) {
-                                            await UIApplication.shared.open(url)
+                                        if let res = await api.activateApp(id: app.id) {
+                                            await installSignedApp(appID: app.id, ipaURLString: res.ipaURL, otaURLString: res.otaURL)
                                         }
                                         isBusy = false
                                     }
                                 }, onToggleActive: {
                                     Task {
+                                        busyMessage = "Signing on server..."
                                         isBusy = true
-                                        if let res = await api.activateApp(id: app.id),
-                                           let url = URL(string: res.otaURL) {
-                                            await UIApplication.shared.open(url)
+                                        if let res = await api.activateApp(id: app.id) {
+                                            await installSignedApp(appID: app.id, ipaURLString: res.ipaURL, otaURLString: res.otaURL)
                                         }
                                         isBusy = false
                                     }
@@ -192,7 +216,7 @@ struct AppsView: View {
             }
             .overlay {
                 if isBusy {
-                    ProgressView("Working on server...")
+                    ProgressView(busyMessage)
                         .padding()
                         .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 12))
                 }
@@ -283,6 +307,7 @@ private struct SignAppSheet: View {
     @State private var bundleID = ""
     @State private var stripExts: Set<String> = []
     @State private var isSigning = false
+    @State private var signProgress = "Signing on server..."
 
     var body: some View {
         NavigationStack {
@@ -338,6 +363,7 @@ private struct SignAppSheet: View {
                 Section {
                     Button {
                         Task {
+                            signProgress = "Signing on server..."
                             isSigning = true
                             if let res = await api.signApp(
                                 id: app.id,
@@ -345,9 +371,23 @@ private struct SignAppSheet: View {
                                 bundleID: bundleID,
                                 stripExtensions: Array(stripExts)
                             ) {
-                                dismiss()
-                                if let url = URL(string: res.otaURL) {
-                                    await UIApplication.shared.open(url)
+                                if DeviceInstaller.shared.hasPairingFile {
+                                    let base = api.serverURL.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+                                    if let ipaURL = URL(string: res.ipaURL ?? "\(base)/ota/\(app.id)/app.ipa") {
+                                        do {
+                                            try await DeviceInstaller.shared.installIPA(from: ipaURL, appID: app.id) { msg in
+                                                signProgress = msg
+                                            }
+                                            dismiss()
+                                        } catch {
+                                            api.errorMessage = error.localizedDescription
+                                        }
+                                    }
+                                } else {
+                                    dismiss()
+                                    if let url = URL(string: res.otaURL) {
+                                        await UIApplication.shared.open(url)
+                                    }
                                 }
                             }
                             isSigning = false
@@ -356,9 +396,13 @@ private struct SignAppSheet: View {
                         HStack {
                             Spacer()
                             if isSigning {
-                                ProgressView()
+                                HStack(spacing: 8) {
+                                    ProgressView()
+                                    Text(signProgress)
+                                        .font(.caption)
+                                }
                             } else {
-                                Text("Sign & Install OTA")
+                                Text(DeviceInstaller.shared.hasPairingFile ? "Sign & Install (SideStore)" : "Sign & Install OTA")
                                     .fontWeight(.semibold)
                             }
                             Spacer()

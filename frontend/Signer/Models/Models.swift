@@ -146,9 +146,11 @@ struct PushSettings: Codable {
 struct SignResponse: Codable {
     let app: SignedApp
     let otaURL: String
+    let ipaURL: String?
 
     enum CodingKeys: String, CodingKey {
         case app
         case otaURL = "ota_url"
+        case ipaURL = "ipa_url"
     }
 }

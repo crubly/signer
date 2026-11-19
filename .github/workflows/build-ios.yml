@@ -20,6 +20,13 @@ jobs:
       - name: Install XcodeGen
         run: brew install xcodegen
 
+      - name: Download IDevice.xcframework
+        run: |
+          mkdir -p frontend/Frameworks
+          curl -fsSL https://github.com/jkcoxson/idevice/releases/download/v0.1.68/idevice-xcframework-v0.1.68.zip -o "$RUNNER_TEMP/idevice.zip"
+          unzip -q "$RUNNER_TEMP/idevice.zip" "swift/IDevice.xcframework/*" -d "$RUNNER_TEMP/idevice_extract"
+          mv "$RUNNER_TEMP/idevice_extract/swift/IDevice.xcframework" frontend/Frameworks/IDevice.xcframework
+
       - name: Generate Xcode Project
         working-directory: frontend
         run: xcodegen generate

@@ -4,3 +4,4 @@ backend/data/
 backend/pgdata/
 frontend/Signer.xcodeproj/
 frontend/build/
+frontend/Frameworks/
