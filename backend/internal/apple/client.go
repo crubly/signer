@@ -831,27 +831,42 @@ func (c *Client) sendGSARequest(requestDict map[string]any, anisette AnisetteHea
 	if err := plist.NewEncoder(&buf).Encode(payload); err != nil {
 		return nil, err
 	}
-	req, err := http.NewRequest(http.MethodPost, gsaURL, &buf)
-	if err != nil {
-		return nil, err
-	}
-	req.Header.Set("Content-Type", "text/x-xml-plist")
-	req.Header.Set("X-MMe-Client-Info", anisette.ClientInfo)
-	req.Header.Set("Accept", "*/*")
-	req.Header.Set("User-Agent", "akd/1.0 CFNetwork/978.0.7 Darwin/18.7.0")
+	var body []byte
+	var statusCode int
+	for attempt := 0; attempt < 2; attempt++ {
+		req, err := http.NewRequest(http.MethodPost, gsaURL, bytes.NewReader(buf.Bytes()))
+		if err != nil {
+			return nil, err
+		}
+		req.Header.Set("Content-Type", "text/x-xml-plist")
+		req.Header.Set("X-MMe-Client-Info", anisette.ClientInfo)
+		req.Header.Set("Accept", "*/*")
+		req.Header.Set("User-Agent", "akd/1.0 CFNetwork/1404.0.5 Darwin/22.3.0")
 
-	resp, err := c.httpClient.Do(req)
-	if err != nil {
-		return nil, err
+		resp, err := c.httpClient.Do(req)
+		if err != nil {
+			return nil, err
+		}
+		statusCode = resp.StatusCode
+		body, err = io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if err != nil {
+			return nil, err
+		}
+		if statusCode == http.StatusServiceUnavailable || statusCode == http.StatusBadGateway || statusCode == http.StatusGatewayTimeout {
+			if attempt == 0 {
+				time.Sleep(1500 * time.Millisecond)
+				continue
+			}
+		}
+		break
 	}
-	defer resp.Body.Close()
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, err
+	if statusCode >= 300 {
+		return nil, fmt.Errorf("Apple auth server returned HTTP %d (try again in a moment)", statusCode)
 	}
 	var out map[string]any
 	if _, err := plist.Unmarshal(body, &out); err != nil {
-		return nil, fmt.Errorf("GSA plist decode error: %w", err)
+		return nil, fmt.Errorf("GSA plist decode error (HTTP %d): %w", statusCode, err)
 	}
 	respDict, ok := out["Response"].(map[string]any)
 	if !ok {
