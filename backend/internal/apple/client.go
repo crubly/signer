@@ -839,9 +839,10 @@ func (c *Client) sendGSARequest(requestDict map[string]any, anisette AnisetteHea
 			return nil, err
 		}
 		req.Header.Set("Content-Type", "text/x-xml-plist")
-		req.Header.Set("X-MMe-Client-Info", anisette.ClientInfo)
 		req.Header.Set("Accept", "*/*")
+		req.Header.Set("Accept-Language", "en-us")
 		req.Header.Set("User-Agent", "akd/1.0 CFNetwork/1404.0.5 Darwin/22.3.0")
+		c.applyAnisetteHeaders(req, anisette)
 
 		resp, err := c.httpClient.Do(req)
 		if err != nil {
