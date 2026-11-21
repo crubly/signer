@@ -23,7 +23,12 @@ import (
 	"howett.net/plist"
 )
 
-const gsaLookupURL = "https://gsa.apple.com/grandslam/GsService2/lookup"
+const (
+	gsaLookupURL          = "https://gsa.apple.com/grandslam/GsService2/lookup"
+	anisette2026ClientInfo = "<MacBookPro18,3> <macOS;26.6;25F84> <com.apple.AuthKit/1 (com.apple.akd/1.0)>"
+	anisette2026UserAgent  = "AuthKit/1 (Macintosh; OS X 26.6) (com.apple.akd/1.0)"
+	anisette2026LocalUser  = "0000000000000000000000000000000000000000000000000000000000000001"
+)
 
 type anisetteV3State struct {
 	IdentifierB64 string `json:"identifier_b64"`
@@ -139,30 +144,16 @@ func (c *Client) fetchAnisetteV3(baseURL string) (AnisetteHeaders, error) {
 }
 
 func (c *Client) provisionAnisetteV3(baseURL string) (*anisetteV3State, error) {
-	// 1. Fetch client_info from local anisette-v3-server
-	ciResp, err := c.httpClient.Get(baseURL + "/v3/client_info")
-	if err != nil {
-		return nil, fmt.Errorf("anisette v3 client_info failed: %w", err)
-	}
-	defer ciResp.Body.Close()
-	var ci struct {
-		ClientInfo string `json:"client_info"`
-		UserAgent  string `json:"user_agent"`
-	}
-	if err := json.NewDecoder(ciResp.Body).Decode(&ci); err != nil {
-		return nil, err
-	}
-	if ci.ClientInfo == "" {
-		return nil, errors.New("empty client_info from anisette v3 server")
-	}
+	clientInfo := anisette2026ClientInfo
+	userAgent := anisette2026UserAgent
 
-	// 2. Fetch Apple provisioning URLs from gsa.apple.com/grandslam/GsService2/lookup
-	startURL, finishURL, err := c.fetchAppleProvisioningURLs(ci.ClientInfo, ci.UserAgent)
+	// 1. Fetch Apple provisioning URLs from gsa.apple.com/grandslam/GsService2/lookup
+	startURL, finishURL, err := c.fetchAppleProvisioningURLs(clientInfo, userAgent)
 	if err != nil {
 		return nil, err
 	}
 
-	// 3. Connect WebSocket to local anisette-v3-server /v3/provisioning_session
+	// 2. Connect WebSocket to local anisette-v3-server /v3/provisioning_session
 	wsURL := strings.Replace(baseURL, "https://", "wss://", 1)
 	wsURL = strings.Replace(wsURL, "http://", "ws://", 1)
 	wsURL = strings.TrimRight(wsURL, "/") + "/v3/provisioning_session"
@@ -178,8 +169,9 @@ func (c *Client) provisionAnisetteV3(baseURL string) (*anisetteV3State, error) {
 	idB64 := base64.StdEncoding.EncodeToString(idBytes)
 	u, _ := uuid.FromBytes(idBytes)
 	deviceID := strings.ToUpper(u.String())
-	luSum := sha256.Sum256(idBytes)
-	localUserID := strings.ToUpper(hex.EncodeToString(luSum[:]))
+	_ = sha256.New
+	_ = hex.EncodeToString
+	localUserID := anisette2026LocalUser
 
 	for {
 		_, msgBytes, err := conn.ReadMessage()
@@ -197,7 +189,7 @@ func (c *Client) provisionAnisetteV3(baseURL string) (*anisetteV3State, error) {
 				return nil, err
 			}
 		case "GiveStartProvisioningData":
-			spim, err := c.appleStartProvisioning(startURL, ci.ClientInfo, ci.UserAgent, deviceID)
+			spim, err := c.appleStartProvisioning(startURL, clientInfo, userAgent, deviceID, localUserID)
 			if err != nil {
 				return nil, err
 			}
@@ -206,7 +198,7 @@ func (c *Client) provisionAnisetteV3(baseURL string) (*anisetteV3State, error) {
 			}
 		case "GiveEndProvisioningData":
 			cpim, _ := msg["cpim"].(string)
-			ptm, tk, err := c.appleFinishProvisioning(finishURL, cpim, ci.ClientInfo, ci.UserAgent, deviceID)
+			ptm, tk, err := c.appleFinishProvisioning(finishURL, cpim, clientInfo, userAgent, deviceID, localUserID)
 			if err != nil {
 				return nil, err
 			}
@@ -224,8 +216,8 @@ func (c *Client) provisionAnisetteV3(baseURL string) (*anisetteV3State, error) {
 				ADIPB:         adiPB,
 				DeviceID:      deviceID,
 				LocalUserID:   localUserID,
-				ClientInfo:    ci.ClientInfo,
-				UserAgent:     ci.UserAgent,
+				ClientInfo:    clientInfo,
+				UserAgent:     userAgent,
 			}, nil
 		default:
 			errMsg, _ := msg["message"].(string)
@@ -263,32 +255,32 @@ func (c *Client) fetchAppleProvisioningURLs(clientInfo, userAgent string) (strin
 	return startURL, finishURL, nil
 }
 
-func (c *Client) appleStartProvisioning(startURL, clientInfo, userAgent, deviceID string) (string, error) {
-	respDict, err := c.postProvisioningPlist(startURL, map[string]any{}, clientInfo, userAgent, deviceID)
+func (c *Client) appleStartProvisioning(startURL, clientInfo, userAgent, deviceID, localUserID string) (string, error) {
+	respDict, err := c.postProvisioningPlist(startURL, map[string]any{}, clientInfo, userAgent, deviceID, localUserID)
 	if err != nil {
 		return "", err
 	}
 	spim, _ := respDict["spim"].(string)
 	if spim == "" {
-		return "", errors.New("missing spim in Apple startProvisioning")
+		return "", fmt.Errorf("missing spim in Apple startProvisioning: %v", respDict)
 	}
 	return spim, nil
 }
 
-func (c *Client) appleFinishProvisioning(finishURL, cpim, clientInfo, userAgent, deviceID string) (string, string, error) {
-	respDict, err := c.postProvisioningPlist(finishURL, map[string]any{"cpim": cpim}, clientInfo, userAgent, deviceID)
+func (c *Client) appleFinishProvisioning(finishURL, cpim, clientInfo, userAgent, deviceID, localUserID string) (string, string, error) {
+	respDict, err := c.postProvisioningPlist(finishURL, map[string]any{"cpim": cpim}, clientInfo, userAgent, deviceID, localUserID)
 	if err != nil {
 		return "", "", err
 	}
 	ptm, _ := respDict["ptm"].(string)
 	tk, _ := respDict["tk"].(string)
 	if ptm == "" || tk == "" {
-		return "", "", errors.New("missing ptm or tk in Apple finishProvisioning")
+		return "", "", fmt.Errorf("missing ptm or tk in Apple finishProvisioning: %v", respDict)
 	}
 	return ptm, tk, nil
 }
 
-func (c *Client) postProvisioningPlist(endpoint string, reqBody map[string]any, clientInfo, userAgent, deviceID string) (map[string]any, error) {
+func (c *Client) postProvisioningPlist(endpoint string, reqBody map[string]any, clientInfo, userAgent, deviceID, localUserID string) (map[string]any, error) {
 	payload := map[string]any{
 		"Header":  map[string]any{},
 		"Request": reqBody,
@@ -302,9 +294,13 @@ func (c *Client) postProvisioningPlist(endpoint string, reqBody map[string]any, 
 		return nil, err
 	}
 	req.Header.Set("Content-Type", "text/x-xml-plist")
+	req.Header.Set("Accept", "*/*")
 	req.Header.Set("X-MMe-Client-Info", clientInfo)
 	req.Header.Set("User-Agent", userAgent)
 	req.Header.Set("X-Mme-Device-Id", deviceID)
+	req.Header.Set("X-Apple-I-MD-LU", localUserID)
+	req.Header.Set("X-Apple-I-MD-RINFO", "17106176")
+	req.Header.Set("X-Apple-I-SRL-NO", "0")
 	req.Header.Set("X-Apple-I-Client-Time", time.Now().UTC().Format("2006-01-02T15:04:05Z"))
 	req.Header.Set("X-Apple-I-TimeZone", "UTC")
 	req.Header.Set("X-Apple-Locale", "en_US")

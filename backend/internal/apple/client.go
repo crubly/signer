@@ -43,7 +43,7 @@ const (
 	xcodeVersion       = "11.2 (11B41)"
 	xcodeUserAgent     = "Xcode"
 	xcodeAppBundleID   = "com.apple.gs.xcode.auth"
-	defaultAnisetteURL = "http://anisette:6969"
+	defaultAnisetteURL = "https://ani.jkcoxson.com"
 )
 
 // SRP-6a 2048-bit prime (RFC 5054) and generator g=2
@@ -142,15 +142,25 @@ func (c *Client) SetAnisetteURL(u string) {
 }
 
 func (c *Client) FetchAnisette() (AnisetteHeaders, error) {
-	// Prefer self-hosted Anisette v3 protocol (/v3/client_info + /v3/provisioning_session + /v3/get_headers)
-	if h, err := c.fetchAnisetteV3(c.anisetteURL); err == nil {
-		return h, nil
-	} else {
-		log.Printf("anisette v3 failed (%v), trying v1 GET %s", err, c.anisetteURL)
+	candidates := []string{c.anisetteURL, defaultAnisetteURL}
+	var lastErr error
+	for _, u := range candidates {
+		u = strings.TrimRight(u, "/")
+		if u == "" || strings.Contains(u, "ani.sidestore.io") || strings.Contains(u, "846969") {
+			u = defaultAnisetteURL
+		}
+		h, err := c.fetchAnisetteV1(u)
+		if err == nil && h.OneTimePassword != "" && h.MachineID != "" {
+			return h, nil
+		}
+		lastErr = err
 	}
+	return AnisetteHeaders{}, lastErr
+}
 
+func (c *Client) fetchAnisetteV1(u string) (AnisetteHeaders, error) {
 	var h AnisetteHeaders
-	req, err := http.NewRequest(http.MethodGet, c.anisetteURL, nil)
+	req, err := http.NewRequest(http.MethodGet, u, nil)
 	if err != nil {
 		return h, err
 	}
@@ -174,7 +184,7 @@ func (c *Client) FetchAnisette() (AnisetteHeaders, error) {
 func normalizeAnisette(h *AnisetteHeaders) {
 	h.ClientTime = time.Now().UTC().Format("2006-01-02T15:04:05Z")
 	if h.ClientInfo == "" {
-		h.ClientInfo = "<MacBookPro13,2> <macOS;13.1;22C65> <com.apple.AuthKit/1 (com.apple.akd/1.0)>"
+		h.ClientInfo = "<MacBookPro13,3> <Mac OS X;10.12.6;16G29> <com.apple.AuthKit/1 (com.apple.akd/1.0)>"
 	}
 	if h.DeviceID == "" {
 		h.DeviceID = strings.ToUpper(uuid.NewString())
@@ -189,14 +199,17 @@ func normalizeAnisette(h *AnisetteHeaders) {
 		h.Locale = "en_US"
 	}
 	if h.TimeZone == "" {
-		h.TimeZone = "UTC"
+		h.TimeZone = "GMT"
+	}
+	if h.LocalUserID == "" {
+		h.LocalUserID = base64.StdEncoding.EncodeToString([]byte(h.DeviceID))
 	}
 }
 
 func buildCPDDict(a AnisetteHeaders) map[string]any {
-	rinfoInt, err := strconv.Atoi(a.RoutingInfo)
-	if err != nil {
-		rinfoInt = 17106176
+	_ = strconv.Atoi
+	if a.RoutingInfo == "" {
+		a.RoutingInfo = "17106176"
 	}
 	return map[string]any{
 		"bootstrap":             true,
@@ -211,7 +224,7 @@ func buildCPDDict(a AnisetteHeaders) map[string]any {
 		"X-Apple-I-MD":          a.OneTimePassword,
 		"X-Apple-I-MD-LU":       a.LocalUserID,
 		"X-Apple-I-MD-M":        a.MachineID,
-		"X-Apple-I-MD-RINFO":    rinfoInt,
+		"X-Apple-I-MD-RINFO":    a.RoutingInfo,
 		"X-Mme-Device-Id":       a.DeviceID,
 		"X-Apple-I-SRL-NO":      a.Serial,
 	}
@@ -848,11 +861,11 @@ func (c *Client) sendGSARequest(requestDict map[string]any, anisette AnisetteHea
 		if err != nil {
 			return nil, err
 		}
+		req.Close = true
 		req.Header.Set("Content-Type", "text/x-xml-plist")
+		req.Header.Set("X-MMe-Client-Info", anisette.ClientInfo)
 		req.Header.Set("Accept", "*/*")
-		req.Header.Set("Accept-Language", "en-us")
-		req.Header.Set("User-Agent", "akd/1.0 CFNetwork/1404.0.5 Darwin/22.3.0")
-		c.applyAnisetteHeaders(req, anisette)
+		req.Header.Set("User-Agent", "AuthKit/1 (Macintosh; OS X 26.6) (com.apple.dt.Xcode/26.0)")
 
 		resp, err := c.httpClient.Do(req)
 		if err != nil {
