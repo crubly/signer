@@ -45,7 +45,7 @@ services:
       ENCRYPTION_KEY: ${ENCRYPTION_KEY}
       JWT_SECRET: ${JWT_SECRET}
       PUBLIC_URL: ${PUBLIC_URL:-}
-      ANISETTE_URL: ${ANISETTE_URL:-http://anisette:6969}
+      ANISETTE_URL: ${ANISETTE_URL:-https://new.ani.sidestore.io}
 
   cloudflared:
     image: cloudflare/cloudflared:latest

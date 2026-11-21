@@ -24,11 +24,16 @@ import (
 )
 
 const (
-	gsaLookupURL          = "https://gsa.apple.com/grandslam/GsService2/lookup"
-	anisette2026ClientInfo = "<MacBookPro18,3> <macOS;26.6;25F84> <com.apple.AuthKit/1 (com.apple.akd/1.0)>"
-	anisette2026UserAgent  = "AuthKit/1 (Macintosh; OS X 26.6) (com.apple.akd/1.0)"
-	anisette2026LocalUser  = "0000000000000000000000000000000000000000000000000000000000000001"
+	gsaLookupURL           = "https://gsa.apple.com/grandslam/GsService2/lookup"
+	anisette2026ClientInfo = "<Mac15,7> <Mac OS X;27.0;26A5378j> <com.apple.AuthKit/1 (com.apple.akd/1.0)>"
+	anisette2026UserAgent  = "akd/1.0 CFNetwork/811.5.4"
 )
+
+var v3FallbackServers = []string{
+	"https://new.ani.sidestore.io",
+	"https://mac-ani.jkcoxson.com",
+	"https://anisette.lillq.me",
+}
 
 type anisetteV3State struct {
 	IdentifierB64 string `json:"identifier_b64"`
@@ -169,9 +174,8 @@ func (c *Client) provisionAnisetteV3(baseURL string) (*anisetteV3State, error) {
 	idB64 := base64.StdEncoding.EncodeToString(idBytes)
 	u, _ := uuid.FromBytes(idBytes)
 	deviceID := strings.ToUpper(u.String())
-	_ = sha256.New
-	_ = hex.EncodeToString
-	localUserID := anisette2026LocalUser
+	luHash := sha256.Sum256(idBytes)
+	localUserID := hex.EncodeToString(luHash[:])
 
 	for {
 		_, msgBytes, err := conn.ReadMessage()

@@ -43,7 +43,7 @@ const (
 	xcodeVersion       = "11.2 (11B41)"
 	xcodeUserAgent     = "Xcode"
 	xcodeAppBundleID   = "com.apple.gs.xcode.auth"
-	defaultAnisetteURL = "https://ani.jkcoxson.com"
+	defaultAnisetteURL = "https://new.ani.sidestore.io"
 )
 
 // SRP-6a 2048-bit prime (RFC 5054) and generator g=2
@@ -142,14 +142,19 @@ func (c *Client) SetAnisetteURL(u string) {
 }
 
 func (c *Client) FetchAnisette() (AnisetteHeaders, error) {
-	candidates := []string{c.anisetteURL, defaultAnisetteURL}
+	candidates := append([]string{c.anisetteURL}, v3FallbackServers...)
 	var lastErr error
+	seen := map[string]bool{}
 	for _, u := range candidates {
 		u = strings.TrimRight(u, "/")
-		if u == "" || strings.Contains(u, "ani.sidestore.io") || strings.Contains(u, "846969") {
+		if u == "" || strings.Contains(u, "://ani.sidestore.io") || strings.Contains(u, "846969") || strings.Contains(u, "://ani.jkcoxson.com") || strings.Contains(u, "anisette:6969") {
 			u = defaultAnisetteURL
 		}
-		h, err := c.fetchAnisetteV1(u)
+		if seen[u] {
+			continue
+		}
+		seen[u] = true
+		h, err := c.fetchAnisetteV3(u)
 		if err == nil && h.OneTimePassword != "" && h.MachineID != "" {
 			return h, nil
 		}
@@ -184,8 +189,9 @@ func (c *Client) fetchAnisetteV1(u string) (AnisetteHeaders, error) {
 func normalizeAnisette(h *AnisetteHeaders) {
 	h.ClientTime = time.Now().UTC().Format("2006-01-02T15:04:05Z")
 	if h.ClientInfo == "" {
-		h.ClientInfo = "<MacBookPro13,3> <Mac OS X;10.12.6;16G29> <com.apple.AuthKit/1 (com.apple.akd/1.0)>"
+		h.ClientInfo = anisette2026ClientInfo
 	}
+	h.ClientInfo = strings.Replace(h.ClientInfo, "<macOS;", "<Mac OS X;", 1)
 	if h.DeviceID == "" {
 		h.DeviceID = strings.ToUpper(uuid.NewString())
 	}
@@ -865,7 +871,7 @@ func (c *Client) sendGSARequest(requestDict map[string]any, anisette AnisetteHea
 		req.Header.Set("Content-Type", "text/x-xml-plist")
 		req.Header.Set("X-MMe-Client-Info", anisette.ClientInfo)
 		req.Header.Set("Accept", "*/*")
-		req.Header.Set("User-Agent", "AuthKit/1 (Macintosh; OS X 26.6) (com.apple.dt.Xcode/26.0)")
+		req.Header.Set("User-Agent", anisette2026UserAgent)
 
 		resp, err := c.httpClient.Do(req)
 		if err != nil {
