@@ -20,6 +20,7 @@ import (
 	"log"
 	"math/big"
 	"net/http"
+	"os"
 	"net/url"
 	"strconv"
 	"strings"
@@ -42,7 +43,7 @@ const (
 	xcodeVersion       = "11.2 (11B41)"
 	xcodeUserAgent     = "Xcode"
 	xcodeAppBundleID   = "com.apple.gs.xcode.auth"
-	defaultAnisetteURL = "https://ani.sidestore.io"
+	defaultAnisetteURL = "http://anisette:6969"
 )
 
 // SRP-6a 2048-bit prime (RFC 5054) and generator g=2
@@ -117,6 +118,7 @@ type DevCert struct {
 type Client struct {
 	httpClient  *http.Client
 	anisetteURL string
+	v3          *anisetteV3Client
 }
 
 func NewClient(anisetteURL string) *Client {
@@ -129,6 +131,7 @@ func NewClient(anisetteURL string) *Client {
 	return &Client{
 		httpClient:  &http.Client{Timeout: 30 * time.Second, Transport: tr},
 		anisetteURL: strings.TrimRight(anisetteURL, "/"),
+		v3:          newAnisetteV3Client(os.Getenv("DATA_DIR")),
 	}
 }
 
@@ -139,6 +142,13 @@ func (c *Client) SetAnisetteURL(u string) {
 }
 
 func (c *Client) FetchAnisette() (AnisetteHeaders, error) {
+	// Prefer self-hosted Anisette v3 protocol (/v3/client_info + /v3/provisioning_session + /v3/get_headers)
+	if h, err := c.fetchAnisetteV3(c.anisetteURL); err == nil {
+		return h, nil
+	} else {
+		log.Printf("anisette v3 failed (%v), trying v1 GET %s", err, c.anisetteURL)
+	}
+
 	var h AnisetteHeaders
 	req, err := http.NewRequest(http.MethodGet, c.anisetteURL, nil)
 	if err != nil {

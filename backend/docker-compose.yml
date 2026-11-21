@@ -15,6 +15,13 @@ services:
       timeout: 5s
       retries: 10
 
+  anisette:
+    image: dadoum/anisette-v3-server:latest
+    container_name: signer-anisette
+    restart: always
+    volumes:
+      - anisette_lib:/home/Alcoholic/.config/anisette-v3/lib
+
   backend:
     build:
       context: .
@@ -24,6 +31,8 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+      anisette:
+        condition: service_started
     ports:
       - "8095:8095"
     volumes:
@@ -36,7 +45,7 @@ services:
       ENCRYPTION_KEY: ${ENCRYPTION_KEY}
       JWT_SECRET: ${JWT_SECRET}
       PUBLIC_URL: ${PUBLIC_URL:-}
-      ANISETTE_URL: ${ANISETTE_URL:-https://ani.846969.xyz}
+      ANISETTE_URL: ${ANISETTE_URL:-http://anisette:6969}
 
   cloudflared:
     image: cloudflare/cloudflared:latest
@@ -48,3 +57,6 @@ services:
     volumes:
       - ./cloudflared:/etc/cloudflared:ro
     command: tunnel --no-autoupdate --config /etc/cloudflared/config.yml run
+
+volumes:
+  anisette_lib:
