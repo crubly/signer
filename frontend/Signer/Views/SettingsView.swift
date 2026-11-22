@@ -56,7 +56,7 @@ struct SettingsView: View {
                             .font(.subheadline)
                     }
 
-                    Button(installer.hasPairingFile ? "Replace Pairing File" : "Import Pairing File (.mobiledevicepairing)") {
+                    Button(installer.hasPairingFile ? "Replace Pairing File" : "Import Pairing File (.mobiledevicepairing / .rppairing)") {
                         showPairingImporter = true
                     }
 
@@ -79,7 +79,7 @@ struct SettingsView: View {
                 } header: {
                     Text("Device Pairing (SideStore Mode)")
                 } footer: {
-                    Text("For free Apple IDs: generate a .mobiledevicepairing file once via JitterbugPair, import it here, and turn on StosVPN (10.7.0.1) before installing or renewing apps.")
+                    Text("For free Apple IDs: generate a .mobiledevicepairing or .rppairing file once via JitterbugPair / idevicepair, import it here, and turn on StosVPN (10.7.0.1) before installing or renewing apps.")
                 }
 
                 Section("Expiration & Push Alerts") {

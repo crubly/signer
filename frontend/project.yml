@@ -21,6 +21,8 @@ targets:
         NSAppTransportSecurity:
           NSAllowsArbitraryLoads: true
         NSLocalNetworkUsageDescription: "Signed connects to lockdownd over local loopback VPN (StosVPN) to install and renew apps."
+        NSBonjourServices:
+          - _remotepairing._tcp
         BGTaskSchedulerPermittedIdentifiers:
           - com.crubly.signed.refresh
         UIBackgroundModes:
